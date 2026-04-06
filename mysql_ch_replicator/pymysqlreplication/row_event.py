@@ -198,7 +198,8 @@ class RowsEvent(BinLogEvent):
     ):
         name = self.table_map[self.table_id].columns[i].name
         if BitGet(cols_bitmap, i) == 0:
-            # This block is only executed when binlog_row_image = MINIMAL.
+            # This block is executed when binlog_row_image = MINIMAL or
+            # FULL_NODUP (for unchanged columns in the after-image).
             # When binlog_row_image = FULL, this block does not execute.
             self.__none_sources[name] = NONE_SOURCE.COLS_BITMAP
             return None
@@ -694,6 +695,26 @@ class UpdateRowsEvent(RowsEvent):
         row["before_none_sources"] = self._get_none_sources(row["before_values"])
         row["after_values"] = self._read_column_data(self.columns_present_bitmap2)
         row["after_none_sources"] = self._get_none_sources(row["after_values"])
+
+        # Support MariaDB binlog_row_image=FULL_NODUP:
+        # The before-image contains all columns, but the after-image only
+        # contains columns that were actually changed.  Columns absent from
+        # the after-image (COLS_BITMAP none-source) must be filled in from
+        # the before-image so that consumers always receive a complete row.
+        cols_bitmap_absent = [
+            col_name for col_name, none_src in row["after_none_sources"].items()
+            if none_src == NONE_SOURCE.COLS_BITMAP and col_name in row["before_values"]
+        ]
+        for col_name in cols_bitmap_absent:
+            row["after_values"][col_name] = row["before_values"][col_name]
+            # Inherit the before none-source (e.g. NULL) or remove the
+            # entry if the before value is non-None.
+            before_src = row["before_none_sources"].get(col_name)
+            if before_src is not None:
+                row["after_none_sources"][col_name] = before_src
+            else:
+                del row["after_none_sources"][col_name]
+
         return row
 
     def _dump(self):
