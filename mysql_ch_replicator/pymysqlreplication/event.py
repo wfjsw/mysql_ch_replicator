@@ -594,6 +594,14 @@ class QueryEvent(BinLogEvent):
             self.hrnow = self.packet.read_uint24()
         elif key == Q_XID:
             self.xid = self.packet.read_uint64()
+        elif key == Q_GTID_FLAGS3:  # 0x82 MariaDB only
+            gtid_flags_extra = self.packet.read_uint8()
+            # FL_COMMIT_ALTER_E1 = 0x04, FL_ROLLBACK_ALTER_E1 = 0x08
+            if gtid_flags_extra & 0x0C:
+                self.packet.advance(8)
+        elif key == Q_CHARACTER_SET_COLLATIONS:  # 0x83 MariaDB only
+            count = self.packet.read_uint8()
+            self.packet.advance(count * 4)
         else:
             raise StatusVariableMismatch
 
