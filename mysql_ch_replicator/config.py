@@ -1,6 +1,7 @@
 import os
 import yaml
 import fnmatch
+import re
 import zoneinfo
 
 from dataclasses import dataclass
@@ -136,6 +137,8 @@ class Settings:
     DEFAULT_CHECK_DB_UPDATED_INTERVAL = 120
     DEFAULT_AUTO_RESTART_INTERVAL = 3600
     DEFAULT_INITIAL_REPLICATION_BATCH_SIZE = 50000
+    SIMPLE_IDENTIFIER_RE = re.compile(r'^`?([A-Za-z_][A-Za-z0-9_]*)`?$')
+    SINGLE_ARG_FUNCTION_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?.*\)$')
 
     def __init__(self):
         self.mysql = MysqlSettings()
@@ -326,6 +329,49 @@ class Settings:
                 continue
             results.append(order_by.order_by)
         return results
+
+    @classmethod
+    def _extract_simple_column_name(cls, expression: str) -> str | None:
+        if not expression:
+            return None
+
+        expression = expression.strip()
+        match = cls.SIMPLE_IDENTIFIER_RE.fullmatch(expression)
+        if match:
+            return match.group(1)
+
+        match = cls.SINGLE_ARG_FUNCTION_RE.fullmatch(expression)
+        if match:
+            return match.group(1)
+
+        return None
+
+    def get_initial_replication_partition_key(self, db_name, table_name):
+        partition_bys = self.get_partition_bys(db_name, table_name)
+        for partition_by in partition_bys:
+            partition_key = self._extract_simple_column_name(partition_by)
+            if partition_key:
+                return partition_key
+        return None
+
+    def get_initial_replication_order_by(self, db_name, table_name, primary_keys: list[str]):
+        order_by_columns = []
+
+        partition_key = self.get_initial_replication_partition_key(db_name, table_name)
+        if partition_key:
+            order_by_columns.append(partition_key)
+
+        configured_order_bys = self.get_order_bys(db_name, table_name)
+        for configured_order_by in configured_order_bys:
+            configured_column = self._extract_simple_column_name(configured_order_by)
+            if configured_column and configured_column not in order_by_columns:
+                order_by_columns.append(configured_column)
+
+        for primary_key in primary_keys:
+            if primary_key not in order_by_columns:
+                order_by_columns.append(primary_key)
+
+        return order_by_columns
 
     def get_post_initial_replication_commands(self, db_name):
         results = []

@@ -107,33 +107,51 @@ class MySQLApi:
         create_statement = res[0][1].strip()
         return create_statement
 
-    def get_records(self, table_name, order_by, limit, start_value=None, worker_id=None, total_workers=None):
+    def get_records(
+        self,
+        table_name,
+        order_by,
+        limit,
+        start_value=None,
+        worker_id=None,
+        total_workers=None,
+        where_conditions=None,
+        enable_worker_hashing=True,
+        partition_name=None,
+    ):
         self.reconnect_if_required()
 
         # Escape column names with backticks to avoid issues with reserved keywords like "key"
         order_by_escaped = [f'`{col}`' for col in order_by]
         order_by_str = ','.join(order_by_escaped)
 
-        where = ''
+        where_clauses = []
         if start_value is not None:
             # Build the start_value condition for pagination
             start_value_str = ','.join(map(str, start_value))
-            where = f'WHERE ({order_by_str}) > ({start_value_str}) '
+            where_clauses.append(f'({order_by_str}) > ({start_value_str})')
+
+        if where_conditions:
+            where_clauses.extend(where_conditions)
 
         # Add partitioning filter for parallel processing (e.g., sharded crawling)
-        if worker_id is not None and total_workers is not None and total_workers > 1:
+        if enable_worker_hashing and worker_id is not None and total_workers is not None and total_workers > 1:
             # Escape column names in COALESCE expressions
             coalesce_expressions = [f"COALESCE(`{key}`, '')" for key in order_by]
             concat_keys = f"CONCAT_WS('|', {', '.join(coalesce_expressions)})"
             hash_condition = f"CRC32({concat_keys}) % {total_workers} = {worker_id}"
+            where_clauses.append(hash_condition)
 
-            if where:
-                where += f'AND {hash_condition} '
-            else:
-                where = f'WHERE {hash_condition} '
+        where = ''
+        if where_clauses:
+            where = f"WHERE {' AND '.join(where_clauses)} "
+
+        partition_clause = ''
+        if partition_name:
+            partition_clause = f' PARTITION (`{partition_name}`)'
 
         # Construct final query
-        query = f'SELECT * FROM `{table_name}` {where}ORDER BY {order_by_str} LIMIT {limit}'
+        query = f'SELECT * FROM `{table_name}`{partition_clause} {where}ORDER BY {order_by_str} LIMIT {limit}'
 
 #         print("Executing query:", query)
 
