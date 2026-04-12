@@ -32,6 +32,7 @@ class DbReplicatorInitial:
         re.IGNORECASE,
     )
     MYSQL_SIMPLE_IDENTIFIER_RE = re.compile(r'^`?([A-Za-z_][A-Za-z0-9_]*)`?$')
+    MYSQL_VOLATILE_TABLE_OPTIONS_RE = re.compile(r'\bAUTO_INCREMENT\s*=\s*\d+\b', re.IGNORECASE)
 
     def __init__(self, replicator):
         self.replicator = replicator
@@ -131,6 +132,8 @@ class DbReplicatorInitial:
         self.replicator.state.save()
 
     def get_structure_signature(self, create_statement):
+        # Ignore volatile table options that do not affect schema.
+        create_statement = self.MYSQL_VOLATILE_TABLE_OPTIONS_RE.sub('AUTO_INCREMENT=0', create_statement)
         normalized_statement = re.sub(r'\s+', ' ', create_statement).strip()
         return hashlib.sha256(normalized_statement.encode('utf-8')).hexdigest()
 
@@ -153,6 +156,14 @@ class DbReplicatorInitial:
             current_mysql_create_statement, required_table_name=table_name,
         )
         original_mysql_structure, _ = self.replicator.state.tables_structure.get(table_name, (None, None))
+
+        # Fallback to parsed structure comparison to avoid false positives from
+        # non-structural CREATE TABLE statement differences.
+        if original_mysql_structure is not None and self._compare_table_structures(
+            current_mysql_structure, original_mysql_structure,
+        ):
+            self.replicator.state.initial_replication_structure_signatures[table_name] = current_signature
+            return
 
         logger.warning(
             f'\n\n\n    !!!  WARNING - TABLE STRUCTURE CHANGED DURING REPLICATION (table "{table_name}") !!!\n\n'
