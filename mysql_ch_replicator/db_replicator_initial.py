@@ -568,11 +568,11 @@ class DbReplicatorInitial:
         """
         Execute initial replication using multiple worker processes.
 
-        Tables are processed in batches.  When available threads exceed the number of
-        remaining tables, all threads are distributed across those tables so no thread
-        slot sits idle: a table with N assigned workers will use N-way intra-table
-        parallelism (partition-strided for MySQL-partitioned tables, hash-sharded
-        otherwise).
+                Workers are scheduled against a global slot pool of size
+                `initial_replication_threads`. Each table owns worker shards
+                `0..initial_replication_threads-1`, and workers are launched dynamically as
+                slots free up. This keeps total concurrency stable and allows multiple tables
+                to continue in parallel even when remaining tables are fewer than threads.
         """
         if not table_names:
             return
@@ -585,93 +585,106 @@ class DbReplicatorInitial:
         remaining = list(table_names)
         last_progress_log_time = 0.0
 
-        while remaining:
-            # How many distinct tables to include in this batch
-            batch_size = min(threads, len(remaining))
-            batch_tables = remaining[:batch_size]
-            remaining = remaining[batch_size:]
+        table_states = {
+            table_name: {
+                'pending_worker_ids': list(range(threads)),
+                'running_workers': 0,
+                'completed_workers': 0,
+            }
+            for table_name in remaining
+        }
 
-            # Spread all available threads across the batch tables
-            base_workers = threads // batch_size
-            extra = threads % batch_size
+        active_processes = []
+        launch_cursor = 0
 
-            # Per-table worker tracking: [total_workers, completed_workers]
-            table_worker_counts = {}
-            active_processes = []
+        def get_launch_candidate_tables():
+            return [
+                table_name
+                for table_name in remaining
+                if table_states[table_name]['pending_worker_ids']
+            ]
 
-            for i, table_name in enumerate(batch_tables):
-                n_workers = base_workers + (1 if i < extra else 0)
-                table_worker_counts[table_name] = [n_workers, 0]
+        def launch_worker(table_name, worker_id):
+            cmd = [
+                sys.executable, "-m", "mysql_ch_replicator.main",
+                "db_replicator",
+                "--config", self.replicator.settings_file,
+                "--db", self.replicator.database,
+                "--worker_id", str(worker_id),
+                "--total_workers", str(threads),
+                "--table", table_name,
+                "--target_db", self.replicator.target_database_tmp,
+                "--initial_only=True",
+            ]
+            logger.info(
+                f"Launching worker {worker_id}/{threads} for table {table_name}: {' '.join(cmd)}"
+            )
+            process = subprocess.Popen(cmd)
+            active_processes.append({
+                'table_name': table_name,
+                'worker_id': worker_id,
+                'process': process,
+            })
+            table_states[table_name]['running_workers'] += 1
 
-                for intra_worker_id in range(n_workers):
-                    cmd = [
-                        sys.executable, "-m", "mysql_ch_replicator.main",
-                        "db_replicator",
-                        "--config", self.replicator.settings_file,
-                        "--db", self.replicator.database,
-                        "--worker_id", str(intra_worker_id),
-                        "--total_workers", str(n_workers),
-                        "--table", table_name,
-                        "--target_db", self.replicator.target_database_tmp,
-                        "--initial_only=True",
-                    ]
-                    logger.info(
-                        f"Launching worker {intra_worker_id}/{n_workers} "
-                        f"for table {table_name}: {' '.join(cmd)}"
-                    )
-                    process = subprocess.Popen(cmd)
-                    active_processes.append({
-                        'table_name': table_name,
-                        'intra_worker_id': intra_worker_id,
-                        'n_workers': n_workers,
-                        'process': process,
-                    })
+        try:
+            while remaining or active_processes:
+                # Fill all available global worker slots.
+                while len(active_processes) < threads:
+                    candidate_tables = get_launch_candidate_tables()
+                    if not candidate_tables:
+                        break
 
-            try:
-                while active_processes:
-                    for ap in active_processes[:]:
-                        if ap['process'].poll() is None:
-                            continue
+                    # Round-robin across tables with pending workers.
+                    selected_table = candidate_tables[launch_cursor % len(candidate_tables)]
+                    launch_cursor += 1
 
-                        table_name = ap['table_name']
-                        exit_code = ap['process'].returncode
-                        active_processes.remove(ap)
+                    worker_id = table_states[selected_table]['pending_worker_ids'].pop(0)
+                    launch_worker(selected_table, worker_id)
 
-                        if exit_code != 0:
-                            logger.error(
-                                f"Worker {ap['intra_worker_id']}/{ap['n_workers']} "
-                                f"for table {table_name} failed with exit code {exit_code}"
-                            )
-                            for pending in active_processes:
-                                pending['process'].terminate()
-                            raise Exception(
-                                f"Worker process for table {table_name} failed with exit code {exit_code}"
-                            )
+                # Handle completed workers.
+                for ap in active_processes[:]:
+                    if ap['process'].poll() is None:
+                        continue
 
-                        logger.info(
-                            f"Worker {ap['intra_worker_id']}/{ap['n_workers']} "
-                            f"completed for table {table_name}"
+                    table_name = ap['table_name']
+                    worker_id = ap['worker_id']
+                    exit_code = ap['process'].returncode
+                    active_processes.remove(ap)
+                    table_states[table_name]['running_workers'] -= 1
+
+                    if exit_code != 0:
+                        logger.error(
+                            f"Worker {worker_id}/{threads} for table {table_name} failed with exit code {exit_code}"
                         )
-                        table_worker_counts[table_name][1] += 1
+                        for pending in active_processes:
+                            pending['process'].terminate()
+                        raise Exception(
+                            f"Worker process for table {table_name} failed with exit code {exit_code}"
+                        )
 
-                        if table_worker_counts[table_name][1] == table_worker_counts[table_name][0]:
-                            logger.info(f"All workers completed for table {table_name}")
-                            self.consolidate_worker_record_versions(table_name)
-                            self.mark_table_completed(table_name)
-                            self.save_state_if_required(force=True)
+                    logger.info(f"Worker {worker_id}/{threads} completed for table {table_name}")
+                    table_states[table_name]['completed_workers'] += 1
 
-                    if active_processes:
-                        time.sleep(0.1)
-                        if time.time() - last_progress_log_time >= 30.0:
-                            last_progress_log_time = time.time()
-                            logger.info(
-                                f"Still waiting for {len(active_processes)} workers to complete"
-                            )
-            except KeyboardInterrupt:
-                logger.warning("Received interrupt, terminating worker processes")
-                for ap in active_processes:
-                    ap['process'].terminate()
-                raise
+                    if table_states[table_name]['completed_workers'] == threads:
+                        logger.info(f"All workers completed for table {table_name}")
+                        self.consolidate_worker_record_versions(table_name)
+                        self.mark_table_completed(table_name)
+                        self.save_state_if_required(force=True)
+                        remaining.remove(table_name)
+
+                if active_processes:
+                    time.sleep(0.1)
+                    if time.time() - last_progress_log_time >= 30.0:
+                        last_progress_log_time = time.time()
+                        logger.info(
+                            f"Still waiting for {len(active_processes)} workers to complete"
+                        )
+        except KeyboardInterrupt:
+            logger.warning("Received interrupt, terminating worker processes")
+            for ap in active_processes:
+                ap['process'].terminate()
+            raise
 
         logger.info("All workers completed initial replication")
         
