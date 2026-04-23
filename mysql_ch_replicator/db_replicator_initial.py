@@ -197,11 +197,6 @@ class DbReplicatorInitial:
 
         return tables
 
-    def get_parallel_worker_identity(self, table_name):
-        eligible_tables = self.get_initial_replication_tables(include_completed=True)
-        worker_id = eligible_tables.index(table_name)
-        total_workers = max(len(eligible_tables), 1)
-        return worker_id, total_workers
 
     def get_mysql_partition_metadata(self, table_name):
         create_statement = self.replicator.mysql_api.get_table_create_statement(table_name)
@@ -335,16 +330,44 @@ class DbReplicatorInitial:
         partition_columns, partition_names = self.get_mysql_partition_metadata(table_name)
         partition_columns = [column for column in partition_columns if column in mysql_field_ids]
 
+        # Intra-table worker assignment: when multiple workers share one table, divide the
+        # work by striding over partitions (partitioned tables) or hashing rows (non-partitioned).
+        intra_worker_id = self.replicator.worker_id if self.replicator.worker_id is not None else 0
+        intra_total_workers = self.replicator.total_workers if self.replicator.total_workers is not None else 1
+        use_intra_table_hash_sharding = False
+        original_partition_names = partition_names[:]
+
+        if intra_total_workers > 1:
+            if partition_names:
+                partition_names = partition_names[intra_worker_id::intra_total_workers]
+                logger.info(
+                    f'Worker {intra_worker_id}/{intra_total_workers}: assigned partitions '
+                    f'{partition_names} for {table_name}'
+                )
+                if not partition_names:
+                    logger.info(
+                        f'Worker {intra_worker_id}/{intra_total_workers}: '
+                        f'no partitions assigned for {table_name}, done'
+                    )
+                    return
+            else:
+                use_intra_table_hash_sharding = True
+                logger.info(
+                    f'Worker {intra_worker_id}/{intra_total_workers}: '
+                    f'using hash-based sharding for {table_name}'
+                )
+
         table_checkpoint = self.replicator.state.initial_replication_table_checkpoints.get(table_name)
         has_legacy_checkpoint = (
             self.replicator.state.initial_replication_table == table_name and
             self.replicator.state.initial_replication_max_primary_key is not None
         )
         should_restart_partitioned_table = (
-            bool(partition_names) and
+            bool(original_partition_names) and
             has_legacy_checkpoint and
             table_checkpoint is None and
-            self.replicator.config.initial_replication_threads > 1
+            self.replicator.config.initial_replication_threads > 1 and
+            not self.replicator.is_parallel_worker
         )
         if should_restart_partitioned_table:
             logger.info(
@@ -415,9 +438,9 @@ class DbReplicatorInitial:
                     order_by=scan_order_by if use_partition_scan else primary_keys,
                     limit=self.replicator.config.initial_replication_batch_size,
                     start_value=query_start_values,
-                    worker_id=self.replicator.worker_id,
-                    total_workers=self.replicator.total_workers,
-                    enable_worker_hashing=False,
+                    worker_id=intra_worker_id if use_intra_table_hash_sharding else None,
+                    total_workers=intra_total_workers if use_intra_table_hash_sharding else None,
+                    enable_worker_hashing=use_intra_table_hash_sharding,
                     partition_name=current_partition_name,
                 )
                 logger.debug(f'extracted {len(mysql_records)} records from mysql')
@@ -543,79 +566,112 @@ class DbReplicatorInitial:
 
     def perform_initial_replication_table_parallel(self, table_names):
         """
-        Execute initial replication using multiple worker processes, one table per worker at a time.
+        Execute initial replication using multiple worker processes.
+
+        Tables are processed in batches.  When available threads exceed the number of
+        remaining tables, all threads are distributed across those tables so no thread
+        slot sits idle: a table with N assigned workers will use N-way intra-table
+        parallelism (partition-strided for MySQL-partitioned tables, hash-sharded
+        otherwise).
         """
         if not table_names:
             return
 
+        threads = self.replicator.config.initial_replication_threads
         logger.info(
-            f"Starting parallel replication for {len(table_names)} tables with {self.replicator.config.initial_replication_threads} workers"
+            f"Starting parallel replication for {len(table_names)} tables with {threads} workers"
         )
 
-        active_processes = []
-        next_table_index = 0
+        remaining = list(table_names)
         last_progress_log_time = 0.0
 
-        def launch_worker(table_name):
-            worker_id, total_workers = self.get_parallel_worker_identity(table_name)
-            cmd = [
-                sys.executable, "-m", "mysql_ch_replicator.main",
-                "db_replicator",
-                "--config", self.replicator.settings_file,
-                "--db", self.replicator.database,
-                "--worker_id", str(worker_id),
-                "--total_workers", str(total_workers),
-                "--table", table_name,
-                "--target_db", self.replicator.target_database_tmp,
-                "--initial_only=True",
-            ]
+        while remaining:
+            # How many distinct tables to include in this batch
+            batch_size = min(threads, len(remaining))
+            batch_tables = remaining[:batch_size]
+            remaining = remaining[batch_size:]
 
-            logger.info(f"Launching worker for table {table_name}: {' '.join(cmd)}")
-            process = subprocess.Popen(cmd)
-            active_processes.append({
-                'table_name': table_name,
-                'process': process,
-            })
+            # Spread all available threads across the batch tables
+            base_workers = threads // batch_size
+            extra = threads % batch_size
 
-        try:
-            while next_table_index < len(table_names) or active_processes:
-                while (
-                    next_table_index < len(table_names) and
-                    len(active_processes) < self.replicator.config.initial_replication_threads
-                ):
-                    launch_worker(table_names[next_table_index])
-                    next_table_index += 1
+            # Per-table worker tracking: [total_workers, completed_workers]
+            table_worker_counts = {}
+            active_processes = []
 
-                for active_process in active_processes[:]:
-                    process = active_process['process']
-                    if process.poll() is None:
-                        continue
+            for i, table_name in enumerate(batch_tables):
+                n_workers = base_workers + (1 if i < extra else 0)
+                table_worker_counts[table_name] = [n_workers, 0]
 
-                    table_name = active_process['table_name']
-                    exit_code = process.returncode
-                    active_processes.remove(active_process)
+                for intra_worker_id in range(n_workers):
+                    cmd = [
+                        sys.executable, "-m", "mysql_ch_replicator.main",
+                        "db_replicator",
+                        "--config", self.replicator.settings_file,
+                        "--db", self.replicator.database,
+                        "--worker_id", str(intra_worker_id),
+                        "--total_workers", str(n_workers),
+                        "--table", table_name,
+                        "--target_db", self.replicator.target_database_tmp,
+                        "--initial_only=True",
+                    ]
+                    logger.info(
+                        f"Launching worker {intra_worker_id}/{n_workers} "
+                        f"for table {table_name}: {' '.join(cmd)}"
+                    )
+                    process = subprocess.Popen(cmd)
+                    active_processes.append({
+                        'table_name': table_name,
+                        'intra_worker_id': intra_worker_id,
+                        'n_workers': n_workers,
+                        'process': process,
+                    })
 
-                    if exit_code != 0:
-                        logger.error(f"Worker process for table {table_name} failed with exit code {exit_code}")
-                        for pending_process in active_processes:
-                            pending_process['process'].terminate()
-                        raise Exception(f"Worker process for table {table_name} failed with exit code {exit_code}")
+            try:
+                while active_processes:
+                    for ap in active_processes[:]:
+                        if ap['process'].poll() is None:
+                            continue
 
-                    logger.info(f"Worker process for table {table_name} completed successfully")
-                    self.consolidate_worker_record_versions(table_name)
-                    self.mark_table_completed(table_name)
-                    self.save_state_if_required(force=True)
+                        table_name = ap['table_name']
+                        exit_code = ap['process'].returncode
+                        active_processes.remove(ap)
 
-                if active_processes:
-                    time.sleep(0.1)
-                    if time.time() - last_progress_log_time >= 30.0:
-                        last_progress_log_time = time.time()
-                        logger.info(f"Still waiting for {len(active_processes)} workers to complete")
-        except KeyboardInterrupt:
-            logger.warning("Received interrupt, terminating worker processes")
-            for active_process in active_processes:
-                active_process['process'].terminate()
-            raise
+                        if exit_code != 0:
+                            logger.error(
+                                f"Worker {ap['intra_worker_id']}/{ap['n_workers']} "
+                                f"for table {table_name} failed with exit code {exit_code}"
+                            )
+                            for pending in active_processes:
+                                pending['process'].terminate()
+                            raise Exception(
+                                f"Worker process for table {table_name} failed with exit code {exit_code}"
+                            )
+
+                        logger.info(
+                            f"Worker {ap['intra_worker_id']}/{ap['n_workers']} "
+                            f"completed for table {table_name}"
+                        )
+                        table_worker_counts[table_name][1] += 1
+
+                        if table_worker_counts[table_name][1] == table_worker_counts[table_name][0]:
+                            logger.info(f"All workers completed for table {table_name}")
+                            self.consolidate_worker_record_versions(table_name)
+                            self.mark_table_completed(table_name)
+                            self.save_state_if_required(force=True)
+
+                    if active_processes:
+                        time.sleep(0.1)
+                        if time.time() - last_progress_log_time >= 30.0:
+                            last_progress_log_time = time.time()
+                            logger.info(
+                                f"Still waiting for {len(active_processes)} workers to complete"
+                            )
+            except KeyboardInterrupt:
+                logger.warning("Received interrupt, terminating worker processes")
+                for ap in active_processes:
+                    ap['process'].terminate()
+                raise
 
         logger.info("All workers completed initial replication")
         

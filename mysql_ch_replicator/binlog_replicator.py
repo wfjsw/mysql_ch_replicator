@@ -143,6 +143,13 @@ class DataReader:
             return file_name
         return None
 
+    def get_first_transaction_id(self):
+        existing_file_nums = get_existing_file_nums(self.data_dir, self.db_name)
+        if not existing_file_nums:
+            return None
+        first_file_num = min(existing_file_nums)
+        return self.get_first_transaction_in_file(first_file_num)
+
     def get_first_transaction_in_file(self, file_num):
         file_name = get_file_name_by_num(self.data_dir, self.db_name, file_num)
         file_reader = FileReader(file_name)
