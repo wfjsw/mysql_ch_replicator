@@ -107,6 +107,23 @@ class MySQLApi:
         create_statement = res[0][1].strip()
         return create_statement
 
+    def get_table_row_estimate(self, table_name) -> int:
+        """
+        Get estimated row count from information_schema.
+        This uses the MySQL optimizer's cardinality estimates and is NOT exact,
+        but is fast and sufficient for progress reporting.
+        """
+        self.reconnect_if_required()
+        self.cursor.execute(
+            'SELECT TABLE_ROWS FROM information_schema.TABLES '
+            'WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s',
+            (self.database, table_name),
+        )
+        res = self.cursor.fetchone()
+        if res and res[0] is not None:
+            return int(res[0])
+        return 0
+
     def get_records(
         self,
         table_name,

@@ -255,6 +255,85 @@ class DbReplicatorInitial:
         self.replicator.state.initial_replication_max_primary_key = None
         self.replicator.state.initial_replication_table = None
 
+    def collect_row_estimates(self, tables_to_process):
+        """
+        Collect estimated row counts from MySQL information_schema for all tables
+        to be processed. These are optimizer estimates and not exact, but sufficient
+        for progress reporting.
+        
+        Also estimates already-replicated rows by querying ClickHouse for current
+        row counts, so resumed replications show meaningful progress from the start.
+        """
+        if not self.replicator.state.initial_replication_row_estimates:
+            logger.info('Collecting row count estimates for progress reporting...')
+            for table_name in tables_to_process:
+                try:
+                    estimate = self.replicator.mysql_api.get_table_row_estimate(table_name)
+                    self.replicator.state.initial_replication_row_estimates[table_name] = estimate
+                    logger.debug(f'Table {table_name}: ~{estimate} rows (estimate)')
+                except Exception:
+                    logger.warning(f'Could not get row estimate for table {table_name}', exc_info=True)
+                    self.replicator.state.initial_replication_row_estimates[table_name] = 0
+            self.replicator.state.save()
+
+        # For already-completed tables, mark their estimate as fully replicated.
+        for table_name in self.replicator.state.initial_replication_completed_tables:
+            if table_name not in self.replicator.state.initial_replication_replicated_rows:
+                estimate = self.replicator.state.initial_replication_row_estimates.get(table_name, 0)
+                self.replicator.state.initial_replication_replicated_rows[table_name] = estimate
+
+        # For in-progress tables (resumed replication), estimate already-replicated
+        # rows from the current ClickHouse row count.
+        for table_name in tables_to_process:
+            if table_name in self.replicator.state.initial_replication_completed_tables:
+                continue
+            if table_name in self.replicator.state.initial_replication_replicated_rows:
+                continue
+            try:
+                target_table_name = self.replicator.get_target_table_name(table_name)
+                ch_count = self.replicator.clickhouse_api.get_table_row_count(target_table_name)
+                if ch_count > 0:
+                    self.replicator.state.initial_replication_replicated_rows[table_name] = ch_count
+                    logger.debug(
+                        f'Table {table_name}: ~{ch_count} rows already in ClickHouse (from resume)'
+                    )
+            except Exception:
+                logger.debug(f'Could not get ClickHouse row count for {table_name}', exc_info=True)
+
+        total_estimate = sum(self.replicator.state.initial_replication_row_estimates.values())
+        total_replicated = sum(self.replicator.state.initial_replication_replicated_rows.values())
+        if total_estimate > 0:
+            pct = total_replicated / total_estimate * 100.0
+            logger.info(
+                f'Estimated total rows to replicate: {total_estimate} across '
+                f'{len(tables_to_process)} tables '
+                f'(already replicated: ~{total_replicated}, {pct:.1f}%)'
+            )
+        else:
+            logger.info(
+                f'Estimated total rows to replicate: {total_estimate} across '
+                f'{len(tables_to_process)} tables'
+            )
+
+    def log_replication_progress(self, table_name, replicated_in_table):
+        """
+        Log progress as replicated_rows / estimated_total_rows across all tables.
+        """
+        self.replicator.state.initial_replication_replicated_rows[table_name] = replicated_in_table
+        total_replicated = sum(self.replicator.state.initial_replication_replicated_rows.values())
+        total_estimate = sum(self.replicator.state.initial_replication_row_estimates.values())
+
+        if total_estimate > 0:
+            pct = total_replicated / total_estimate * 100.0
+            logger.info(
+                f'Progress: {total_replicated}/{total_estimate} rows '
+                f'({pct:.1f}%) replicated across all tables'
+            )
+        else:
+            logger.info(
+                f'Progress: {total_replicated} rows replicated (no estimates available)'
+            )
+
     def perform_initial_replication(self):
         self.replicator.clickhouse_api.database = self.replicator.target_database_tmp
         logger.info('running initial replication')
@@ -262,6 +341,9 @@ class DbReplicatorInitial:
         self.replicator.state.save()
         start_table = self.replicator.state.initial_replication_table
         tables_to_process = self.get_initial_replication_tables(start_table=start_table)
+
+        if not self.replicator.is_parallel_worker:
+            self.collect_row_estimates(tables_to_process)
 
         if not self.replicator.is_parallel_worker and self.replicator.config.initial_replication_threads > 1 and not self.replicator.single_table:
             self.perform_initial_replication_table_parallel(tables_to_process)
@@ -494,6 +576,7 @@ class DbReplicatorInitial:
                         f'replicated {stats_number_of_records} records, '
                         f'primary key: {max_primary_key}',
                     )
+                    self.log_replication_progress(table_name, stats_number_of_records)
 
             partition_index += 1
             if partition_index < len(partitions_to_process):
@@ -512,6 +595,7 @@ class DbReplicatorInitial:
             f'replicated {stats_number_of_records} records, '
             f'primary key: {max_primary_key}',
         )
+        self.log_replication_progress(table_name, stats_number_of_records)
         self.mark_table_completed(table_name)
         self.save_state_if_required(force=True)
     
@@ -577,12 +661,15 @@ class DbReplicatorInitial:
         if not table_names:
             return
 
+        self.collect_row_estimates(table_names)
+
         threads = self.replicator.config.initial_replication_threads
         logger.info(
             f"Starting parallel replication for {len(table_names)} tables with {threads} workers"
         )
 
         remaining = list(table_names)
+        total_tables = len(table_names)
         last_progress_log_time = 0.0
 
         table_states = {
@@ -673,12 +760,33 @@ class DbReplicatorInitial:
                         self.save_state_if_required(force=True)
                         remaining.remove(table_name)
 
+                        # Log table-level progress
+                        completed_tables = total_tables - len(remaining)
+                        completed_estimate = sum(
+                            self.replicator.state.initial_replication_row_estimates.get(t, 0)
+                            for t in table_names
+                            if t not in remaining
+                        )
+                        total_estimate = sum(self.replicator.state.initial_replication_row_estimates.values())
+                        if total_estimate > 0:
+                            pct = completed_estimate / total_estimate * 100.0
+                            logger.info(
+                                f'Progress: {completed_tables}/{total_tables} tables done, '
+                                f'~{completed_estimate}/{total_estimate} rows ({pct:.1f}%)'
+                            )
+                        else:
+                            logger.info(
+                                f'Progress: {completed_tables}/{total_tables} tables done'
+                            )
+
                 if active_processes:
                     time.sleep(0.1)
                     if time.time() - last_progress_log_time >= 30.0:
                         last_progress_log_time = time.time()
+                        completed_tables = total_tables - len(remaining)
                         logger.info(
-                            f"Still waiting for {len(active_processes)} workers to complete"
+                            f"Still waiting for {len(active_processes)} workers to complete "
+                            f"({completed_tables}/{total_tables} tables done)"
                         )
         except KeyboardInterrupt:
             logger.warning("Received interrupt, terminating worker processes")

@@ -43,6 +43,8 @@ class State:
         self.initial_replication_table_checkpoints = {}
         self.initial_replication_structure_signatures = {}
         self.initial_replication_completed_tables = []
+        self.initial_replication_row_estimates = {}
+        self.initial_replication_replicated_rows = {}
         self.tables_structure: dict = {}
         self.tables = []
         self.pid = None
@@ -63,6 +65,8 @@ class State:
         self.initial_replication_table_checkpoints = data.get('initial_replication_table_checkpoints', {})
         self.initial_replication_structure_signatures = data.get('initial_replication_structure_signatures', {})
         self.initial_replication_completed_tables = data.get('initial_replication_completed_tables', [])
+        self.initial_replication_row_estimates = data.get('initial_replication_row_estimates', {})
+        self.initial_replication_replicated_rows = data.get('initial_replication_replicated_rows', {})
         self.tables_structure = data['tables_structure']
         self.tables = data['tables']
         self.pid = data.get('pid', None)
@@ -78,6 +82,8 @@ class State:
             'initial_replication_table_checkpoints': self.initial_replication_table_checkpoints,
             'initial_replication_structure_signatures': self.initial_replication_structure_signatures,
             'initial_replication_completed_tables': self.initial_replication_completed_tables,
+            'initial_replication_row_estimates': self.initial_replication_row_estimates,
+            'initial_replication_replicated_rows': self.initial_replication_replicated_rows,
             'tables_structure': self.tables_structure,
             'tables': self.tables,
             'pid': os.getpid(),

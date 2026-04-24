@@ -465,3 +465,18 @@ class ClickhouseApi:
         except Exception as e:
             logger.error(f"Error querying max _version for table {table_name}: {e}")
             return None
+
+    def get_table_row_count(self, table_name) -> int:
+        """
+        Get the current row count of a table in ClickHouse.
+        Used for estimating already-replicated rows when resuming initial replication.
+        """
+        try:
+            query = f"SELECT COUNT() FROM `{self.database}`.`{table_name}`"
+            result = self.client.query(query)
+            if result.result_rows and result.result_rows[0][0] is not None:
+                return int(result.result_rows[0][0])
+            return 0
+        except Exception as e:
+            logger.warning(f"Could not get row count for table {table_name}: {e}")
+            return 0
