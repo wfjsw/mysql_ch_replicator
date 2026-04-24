@@ -342,8 +342,7 @@ class DbReplicatorInitial:
         start_table = self.replicator.state.initial_replication_table
         tables_to_process = self.get_initial_replication_tables(start_table=start_table)
 
-        if not self.replicator.is_parallel_worker:
-            self.collect_row_estimates(tables_to_process)
+        self.collect_row_estimates(tables_to_process)
 
         if not self.replicator.is_parallel_worker and self.replicator.config.initial_replication_threads > 1 and not self.replicator.single_table:
             self.perform_initial_replication_table_parallel(tables_to_process)
@@ -661,15 +660,14 @@ class DbReplicatorInitial:
         if not table_names:
             return
 
-        self.collect_row_estimates(table_names)
-
         threads = self.replicator.config.initial_replication_threads
         logger.info(
             f"Starting parallel replication for {len(table_names)} tables with {threads} workers"
         )
 
         remaining = list(table_names)
-        total_tables = len(table_names)
+        already_completed = len(self.replicator.state.initial_replication_completed_tables)
+        total_tables = len(table_names) + already_completed
         last_progress_log_time = 0.0
 
         table_states = {
@@ -761,12 +759,15 @@ class DbReplicatorInitial:
                         remaining.remove(table_name)
 
                         # Log table-level progress
-                        completed_tables = total_tables - len(remaining)
+                        completed_tables = already_completed + (len(table_names) - len(remaining))
                         completed_estimate = sum(
                             self.replicator.state.initial_replication_row_estimates.get(t, 0)
                             for t in table_names
                             if t not in remaining
                         )
+                        # Add estimates for already-completed tables
+                        for t in self.replicator.state.initial_replication_completed_tables:
+                            completed_estimate += self.replicator.state.initial_replication_row_estimates.get(t, 0)
                         total_estimate = sum(self.replicator.state.initial_replication_row_estimates.values())
                         if total_estimate > 0:
                             pct = completed_estimate / total_estimate * 100.0
@@ -783,7 +784,7 @@ class DbReplicatorInitial:
                     time.sleep(0.1)
                     if time.time() - last_progress_log_time >= 30.0:
                         last_progress_log_time = time.time()
-                        completed_tables = total_tables - len(remaining)
+                        completed_tables = already_completed + (len(table_names) - len(remaining))
                         logger.info(
                             f"Still waiting for {len(active_processes)} workers to complete "
                             f"({completed_tables}/{total_tables} tables done)"
