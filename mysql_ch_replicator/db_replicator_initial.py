@@ -39,6 +39,45 @@ class DbReplicatorInitial:
         self.last_touch_time = 0
         self.last_save_state_time = 0
 
+    def migrate_crc32_state_if_needed(self):
+        """Detect and migrate state files written by the old CRC32 hash-sharding implementation.
+
+        CRC32-era state files do not contain the 'worker_sharding_mode' key (it will be None
+        after loading).  If such a state exists AND an initial replication was in progress
+        (i.e. a table was partially processed), the checkpoint primary-key value is NOT safe to
+        reuse: the old worker only visited rows where ``CRC32(pk) % total_workers == worker_id``,
+        so many rows inside the new worker's contiguous PK range were never replicated.
+
+        Migration:
+        - Completed tables (``initial_replication_completed_tables``) are kept — they are fully
+          replicated regardless of sharding strategy.
+        - The in-progress table cursor (``initial_replication_table`` /
+          ``initial_replication_max_primary_key`` / ``initial_replication_table_checkpoints``) is
+          cleared so the table is re-replicated from scratch under the new scheme.
+        - ``worker_sharding_mode`` is set to ``'range'`` so this migration never fires again.
+        """
+        state = self.replicator.state
+        if state.worker_sharding_mode is not None:
+            # Already migrated or freshly created under the new scheme.
+            return
+
+        in_progress_table = state.initial_replication_table
+        if in_progress_table is not None:
+            logger.warning(
+                f'\n\n    !!! CRC32-era checkpoint detected for table "{in_progress_table}" !!!\n'
+                '    The old hash-based sharding checkpoint cannot be safely resumed with the\n'
+                '    new range-based sharding.  Resetting in-progress state for this table so\n'
+                '    it will be re-replicated from scratch.  Already-completed tables are kept.\n'
+            )
+            state.initial_replication_table = None
+            state.initial_replication_max_primary_key = None
+            state.initial_replication_table_checkpoints.pop(in_progress_table, None)
+            state.initial_replication_replicated_rows.pop(in_progress_table, None)
+
+        state.worker_sharding_mode = 'range'
+        state.save()
+        logger.info('worker_sharding_mode set to "range"; CRC32 migration complete.')
+
     def create_initial_structure(self):
         self.replicator.state.status = Status.CREATING_INITIAL_STRUCTURES
         for table in self.replicator.state.tables:
@@ -335,6 +374,7 @@ class DbReplicatorInitial:
             )
 
     def perform_initial_replication(self):
+        self.migrate_crc32_state_if_needed()
         self.replicator.clickhouse_api.database = self.replicator.target_database_tmp
         logger.info('running initial replication')
         self.replicator.state.status = Status.PERFORMING_INITIAL_REPLICATION
@@ -412,10 +452,13 @@ class DbReplicatorInitial:
         partition_columns = [column for column in partition_columns if column in mysql_field_ids]
 
         # Intra-table worker assignment: when multiple workers share one table, divide the
-        # work by striding over partitions (partitioned tables) or hashing rows (non-partitioned).
+        # work by striding over partitions (partitioned tables) or by primary-key range
+        # (non-partitioned tables).  Range sharding avoids full-table scans that CRC32
+        # hash filtering required because MySQL can satisfy the WHERE clause using the
+        # primary-key index directly.
         intra_worker_id = self.replicator.worker_id if self.replicator.worker_id is not None else 0
         intra_total_workers = self.replicator.total_workers if self.replicator.total_workers is not None else 1
-        use_intra_table_hash_sharding = False
+        pk_range_where_conditions = []   # populated for non-partitioned intra-table sharding
         original_partition_names = partition_names[:]
 
         if intra_total_workers > 1:
@@ -432,11 +475,90 @@ class DbReplicatorInitial:
                     )
                     return
             else:
-                use_intra_table_hash_sharding = True
-                logger.info(
-                    f'Worker {intra_worker_id}/{intra_total_workers}: '
-                    f'using hash-based sharding for {table_name}'
-                )
+                # Range-based sharding on the first primary key column.
+                # Each worker owns an exclusive, contiguous slice of the PK range so MySQL
+                # can satisfy the predicate via an index range scan instead of a full scan.
+                pk_field = primary_keys[0] if primary_keys else None
+                pk_field_type = mysql_field_types.get(pk_field, '') if pk_field else ''
+                pk_is_integer = pk_field and 'int' in pk_field_type.lower()
+
+                if pk_is_integer:
+                    min_pk, max_pk = self.replicator.mysql_api.get_pk_bounds(table_name, pk_field)
+                    if min_pk is None:
+                        # Table is empty; all workers return immediately.
+                        logger.info(
+                            f'Worker {intra_worker_id}/{intra_total_workers}: '
+                            f'table {table_name} is empty, nothing to do'
+                        )
+                        return
+                    total_range = max_pk - min_pk + 1
+                    range_start = min_pk + (intra_worker_id * total_range) // intra_total_workers
+                    excl_range_end = min_pk + ((intra_worker_id + 1) * total_range) // intra_total_workers
+                    range_end = excl_range_end - 1
+                    if range_start > range_end:
+                        logger.info(
+                            f'Worker {intra_worker_id}/{intra_total_workers}: '
+                            f'empty PK range for {table_name}, nothing to do'
+                        )
+                        return
+                    pk_range_where_conditions = [
+                        f'`{pk_field}` >= {range_start}',
+                        f'`{pk_field}` <= {range_end}',
+                    ]
+                    logger.info(
+                        f'Worker {intra_worker_id}/{intra_total_workers}: '
+                        f'PK range [{range_start}, {range_end}] for {table_name}'
+                    )
+                else:
+                    # Non-integer single-column PK (e.g. UUID / VARCHAR).
+                    # Divide the sorted PK space into N slices using sampled split points.
+                    # Split-point queries run once at startup so the OFFSET cost is acceptable.
+                    # Composite PKs (more than one column) are not split — worker 0 handles them.
+                    if len(primary_keys) != 1:
+                        if intra_worker_id != 0:
+                            logger.info(
+                                f'Worker {intra_worker_id}/{intra_total_workers}: '
+                                f'composite PK on {table_name}, skipping (handled by worker 0)'
+                            )
+                            return
+                        logger.info(
+                            f'Worker 0/{intra_total_workers}: '
+                            f'composite PK on {table_name}, processing as sole worker'
+                        )
+                    else:
+                        split_points = self.replicator.mysql_api.get_pk_split_points(
+                            table_name, pk_field, intra_total_workers
+                        )
+                        if not split_points:
+                            # Empty table or couldn't split — only worker 0 proceeds.
+                            if intra_worker_id != 0:
+                                logger.info(
+                                    f'Worker {intra_worker_id}/{intra_total_workers}: '
+                                    f'no split points for {table_name}, skipping'
+                                )
+                                return
+                        else:
+                            lower = split_points[intra_worker_id - 1] if intra_worker_id > 0 else None
+                            upper = split_points[intra_worker_id] if intra_worker_id < len(split_points) else None
+                            if lower is not None:
+                                pk_range_where_conditions.append(
+                                    f'`{pk_field}` > {MySQLApi._quote_pk_value(lower)}'
+                                )
+                            if upper is not None:
+                                pk_range_where_conditions.append(
+                                    f'`{pk_field}` <= {MySQLApi._quote_pk_value(upper)}'
+                                )
+                            if intra_worker_id >= len(split_points) + 1:
+                                # More workers than split points; this worker has no rows.
+                                logger.info(
+                                    f'Worker {intra_worker_id}/{intra_total_workers}: '
+                                    f'no slice assigned for {table_name}, skipping'
+                                )
+                                return
+                            logger.info(
+                                f'Worker {intra_worker_id}/{intra_total_workers}: '
+                                f'PK slice ({lower!r}, {upper!r}] for {table_name}'
+                            )
 
         table_checkpoint = self.replicator.state.initial_replication_table_checkpoints.get(table_name)
         has_legacy_checkpoint = (
@@ -519,9 +641,7 @@ class DbReplicatorInitial:
                     order_by=scan_order_by if use_partition_scan else primary_keys,
                     limit=self.replicator.config.initial_replication_batch_size,
                     start_value=query_start_values,
-                    worker_id=intra_worker_id if use_intra_table_hash_sharding else None,
-                    total_workers=intra_total_workers if use_intra_table_hash_sharding else None,
-                    enable_worker_hashing=use_intra_table_hash_sharding,
+                    where_conditions=pk_range_where_conditions if not use_partition_scan else None,
                     partition_name=current_partition_name,
                 )
                 logger.debug(f'extracted {len(mysql_records)} records from mysql')

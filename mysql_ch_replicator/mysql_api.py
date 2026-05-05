@@ -124,6 +124,60 @@ class MySQLApi:
             return int(res[0])
         return 0
 
+    def get_pk_bounds(self, table_name, primary_key):
+        """Return (min_val, max_val) for *primary_key* column, using a fast index-only scan.
+        Returns (None, None) when the table is empty."""
+        self.reconnect_if_required()
+        self.cursor.execute(
+            f'SELECT MIN(`{primary_key}`), MAX(`{primary_key}`) FROM `{table_name}`'
+        )
+        res = self.cursor.fetchone()
+        if res and res[0] is not None:
+            return res[0], res[1]
+        return None, None
+
+    def get_pk_split_points(self, table_name, primary_key, total_workers):
+        """Return a list of (total_workers - 1) PK values that divide the table into
+        roughly equal-sized chunks for parallel workers.
+
+        Each value is sampled by fetching the PK at evenly-spaced OFFSET positions from
+        an ``ORDER BY pk`` scan.  OFFSET queries run only once at startup, so the cost is
+        acceptable even for large tables.  The boundary values are used as ``pk > split[i-1]
+        AND pk <= split[i]`` predicates which MySQL can satisfy via a PK index range scan.
+
+        Returns an empty list when the table is empty or only one worker is used.
+        """
+        self.reconnect_if_required()
+        row_estimate = self.get_table_row_estimate(table_name)
+        if row_estimate <= 0 or total_workers <= 1:
+            return []
+
+        split_points = []
+        for i in range(1, total_workers):
+            offset = max(0, (i * row_estimate) // total_workers - 1)
+            self.cursor.execute(
+                f'SELECT `{primary_key}` FROM `{table_name}` ORDER BY `{primary_key}` LIMIT 1 OFFSET %s',
+                (offset,),
+            )
+            row = self.cursor.fetchone()
+            if row is None:
+                break
+            value = row[0]
+            # Deduplicate: skip if same as last boundary (dense duplicate region).
+            if split_points and split_points[-1] == value:
+                continue
+            split_points.append(value)
+
+        return split_points
+
+    @staticmethod
+    def _quote_pk_value(value):
+        """Return a SQL literal for a PK value (int or string)."""
+        if isinstance(value, (int, float)):
+            return str(value)
+        escaped = str(value).replace('\\', '\\\\').replace("'", "\\'")
+        return f"'{escaped}'"
+
     def get_records(
         self,
         table_name,
