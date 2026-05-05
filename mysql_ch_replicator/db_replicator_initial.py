@@ -529,6 +529,11 @@ class DbReplicatorInitial:
                         split_points = self.replicator.mysql_api.get_pk_split_points(
                             table_name, pk_field, intra_total_workers
                         )
+                        logger.info(
+                            f'Worker {intra_worker_id}/{intra_total_workers}: '
+                            f'computed {len(split_points)} split points for {table_name} '
+                            f'(expected up to {max(0, intra_total_workers - 1)})'
+                        )
                         if not split_points:
                             # Empty table or couldn't split — only worker 0 proceeds.
                             if intra_worker_id != 0:

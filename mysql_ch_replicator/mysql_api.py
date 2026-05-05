@@ -140,33 +140,77 @@ class MySQLApi:
         """Return a list of (total_workers - 1) PK values that divide the table into
         roughly equal-sized chunks for parallel workers.
 
-        Each value is sampled by fetching the PK at evenly-spaced OFFSET positions from
-        an ``ORDER BY pk`` scan.  OFFSET queries run only once at startup, so the cost is
-        acceptable even for large tables.  The boundary values are used as ``pk > split[i-1]
-        AND pk <= split[i]`` predicates which MySQL can satisfy via a PK index range scan.
+        This method avoids full ``COUNT(*)`` on huge tables (which can be too slow or hit
+        max statement time).  Instead, it uses an index-driven jump strategy:
+        - choose an initial jump size from information_schema row estimate
+        - repeatedly seek a boundary with ``WHERE pk > last ORDER BY pk LIMIT jump-1,1``
+        - if seek fails near the tail, reduce jump size and retry
+
+        The boundary values are used as ``pk > split[i-1] AND pk <= split[i]`` predicates,
+        which MySQL can satisfy via a PK index range scan.
 
         Returns an empty list when the table is empty or only one worker is used.
         """
         self.reconnect_if_required()
-        row_estimate = self.get_table_row_estimate(table_name)
-        if row_estimate <= 0 or total_workers <= 1:
+        if total_workers <= 1:
             return []
 
+        # Ensure table is non-empty and initialize the first seek anchor.
+        self.cursor.execute(
+            f'SELECT `{primary_key}` FROM `{table_name}` ORDER BY `{primary_key}` LIMIT 1'
+        )
+        first_row = self.cursor.fetchone()
+        if first_row is None:
+            return []
+
+        row_estimate = self.get_table_row_estimate(table_name)
+        # Conservative fallback when estimate is unavailable.
+        if row_estimate <= 0:
+            row_estimate = total_workers * 1024
+
+        jump = max(1, row_estimate // total_workers)
         split_points = []
+        last_boundary = None
         for i in range(1, total_workers):
-            offset = max(0, (i * row_estimate) // total_workers - 1)
-            self.cursor.execute(
-                f'SELECT `{primary_key}` FROM `{table_name}` ORDER BY `{primary_key}` LIMIT 1 OFFSET %s',
-                (offset,),
-            )
-            row = self.cursor.fetchone()
+            current_jump = jump
+            row = None
+
+            # Adaptive retry: shrink jump size when near tail until we find a boundary.
+            while current_jump >= 1:
+                offset = current_jump - 1
+                if last_boundary is None:
+                    self.cursor.execute(
+                        f'SELECT `{primary_key}` FROM `{table_name}` '
+                        f'ORDER BY `{primary_key}` LIMIT %s,1',
+                        (offset,),
+                    )
+                else:
+                    self.cursor.execute(
+                        f'SELECT `{primary_key}` FROM `{table_name}` '
+                        f'WHERE `{primary_key}` > %s '
+                        f'ORDER BY `{primary_key}` LIMIT %s,1',
+                        (last_boundary, offset),
+                    )
+                row = self.cursor.fetchone()
+                if row is not None:
+                    break
+                if current_jump == 1:
+                    break
+                current_jump = max(1, current_jump // 2)
+
             if row is None:
                 break
+
             value = row[0]
-            # Deduplicate: skip if same as last boundary (dense duplicate region).
+            # Boundaries must be strictly increasing to avoid empty/overlapping slices.
             if split_points and split_points[-1] == value:
-                continue
+                break
+
             split_points.append(value)
+            last_boundary = value
+
+            # If we had to shrink jump, keep the reduced value for next boundary.
+            jump = max(1, min(jump, current_jump))
 
         return split_points
 
