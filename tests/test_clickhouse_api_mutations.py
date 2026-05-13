@@ -2,6 +2,7 @@ import pytest
 from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
 
 from mysql_ch_replicator import clickhouse_api
+from mysql_ch_replicator.utils import GracefulKiller
 
 
 def _build_api(monkeypatch, *, max_unfinished_mutations_to_wait=900):
@@ -112,6 +113,20 @@ def test_erase_does_not_retry_other_database_errors(monkeypatch):
 
     with pytest.raises(DatabaseError, match='Table does not exist'):
         api.erase('test_table', ['id'], {'1'})
+
+    assert sleeps == []
+    assert api.stats.general.erases.events == 0
+
+
+def test_erase_stops_waiting_when_shutdown_requested(monkeypatch):
+    api, sleeps = _build_api(monkeypatch, max_unfinished_mutations_to_wait=2)
+    GracefulKiller.kill_now = True
+
+    try:
+        with pytest.raises(clickhouse_api.ClickhouseApi.ShutdownRequested):
+            api.erase('test_table', ['id'], {'1'})
+    finally:
+        GracefulKiller.kill_now = False
 
     assert sleeps == []
     assert api.stats.general.erases.events == 0

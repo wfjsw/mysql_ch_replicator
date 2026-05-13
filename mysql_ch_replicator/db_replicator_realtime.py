@@ -73,7 +73,10 @@ class DbReplicatorRealtime:
             self.handle_event(event)
 
         logger.info('stopping db_replicator')
-        self.upload_records()
+        try:
+            self.upload_records()
+        except self.replicator.clickhouse_api.ShutdownRequested:
+            logger.warning('skip final records upload because shutdown was requested')
         self.save_state_if_required(force=True)
         logger.info('stopped')
 

@@ -9,6 +9,7 @@ from collections import defaultdict
 
 from .config import ClickhouseSettings
 from .table_structure import TableStructure, TableField
+from .utils import GracefulKiller
 
 
 logger = getLogger(__name__)
@@ -90,6 +91,9 @@ class ClickhouseApi:
     SESSION_IS_LOCKED_ERROR_CODE = 373
     TOO_MANY_MUTATIONS_ERROR_CODE = 692
     DISTRIBUTED_TABLE_SUFFIX = '_distributed'
+
+    class ShutdownRequested(Exception):
+        pass
 
     def __init__(self, database: str | None, clickhouse_settings: ClickhouseSettings, version_initial_value: int = 0):
         self.database = database
@@ -242,6 +246,8 @@ class ClickhouseApi:
             return
 
         while True:
+            if GracefulKiller.kill_now:
+                raise ClickhouseApi.ShutdownRequested()
             unfinished_mutations = self._get_unfinished_mutations_count(table_name)
             if unfinished_mutations < self.max_unfinished_mutations_to_wait:
                 return
@@ -444,6 +450,8 @@ class ClickhouseApi:
             })
             
             while True:
+                if GracefulKiller.kill_now:
+                    raise ClickhouseApi.ShutdownRequested()
                 self._wait_for_mutation_backlog(table_name)
                 t1 = time.time()
                 try:

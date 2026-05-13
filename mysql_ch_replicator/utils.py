@@ -17,6 +17,7 @@ class GracefulKiller:
         signal.signal(signal.SIGTERM, self.exit_gracefully)
 
     def exit_gracefully(self, signum, frame):
+        GracefulKiller.kill_now = True
         self.kill_now = True
 
 
