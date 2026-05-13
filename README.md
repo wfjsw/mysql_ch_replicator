@@ -227,6 +227,8 @@ clickhouse:
   password: 'default'
   connection_timeout: 30        # optional
   send_receive_timeout: 300     # optional
+  max_unfinished_mutations_to_wait: 900  # optional, waits before issuing more DELETE mutations when a table reaches this unfinished mutation count
+  mutation_backpressure_sleep: 10        # optional, seconds to sleep while waiting for ClickHouse mutation backlog to drain
   cluster: 'cluster_name'       # optional - should match cluster name defined in config files located at /etc/clickhouse-server
 
 binlog_replicator:
@@ -318,6 +320,8 @@ version_initial_value: 0  # optional, initial value for _version column (default
 - `ignore_deletes` - when set to `true`, DELETE operations in MySQL will be ignored during replication. This creates an append-only model where data is only added, never removed. In this mode, the replicator doesn't create a temporary database and instead replicates directly to the target database.
 - `skip_initial_replication` - when set to `true`, skips the initial data copy and starts realtime replication immediately. This is useful when ClickHouse tables already exist with data and you want to continue replication from the current binlog position. **Important**: ClickHouse tables must have the same structure as MySQL tables, plus an additional `_version` UInt64 column (used by ReplacingMergeTree engine). No temporary database is created in this mode.
 - `version_initial_value` - initial value for the `_version` column when no pre-saved version exists. Default is 0. This is useful when you want to start versioning from a specific number (e.g., to avoid conflicts with existing data from other sources).
+- `clickhouse.max_unfinished_mutations_to_wait` - maximum unfinished ClickHouse mutations allowed per replicated table before DELETE replication waits. Default is 900; set to `0` to disable the proactive wait. This prevents ClickHouse error 692 (`TOO_MANY_MUTATIONS`) from crashing realtime replication under heavy delete/update load.
+- `clickhouse.mutation_backpressure_sleep` - seconds to sleep before rechecking mutation backlog or retrying a delete after ClickHouse returns `TOO_MANY_MUTATIONS`. Default is 10.
 
 Example - MySQL table:
 ```sql

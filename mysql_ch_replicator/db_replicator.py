@@ -45,7 +45,10 @@ class State:
         self.initial_replication_completed_tables = []
         self.initial_replication_row_estimates = {}
         self.initial_replication_replicated_rows = {}
-        self.worker_sharding_mode = None   # 'range' once range-based sharding has been used
+        # Sharding strategy marker for initial-replication worker checkpoints.
+        # None: legacy (no explicit strategy marker).
+        # split_points_v2: current row-balanced split-point sharding.
+        self.worker_sharding_mode = None
         self.tables_structure: dict = {}
         self.tables = []
         self.pid = None

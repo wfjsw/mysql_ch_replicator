@@ -87,12 +87,16 @@ class GeneralStats:
 class ClickhouseApi:
     MAX_RETRIES = 5
     RETRY_INTERVAL = 30
+    SESSION_IS_LOCKED_ERROR_CODE = 373
+    TOO_MANY_MUTATIONS_ERROR_CODE = 692
     DISTRIBUTED_TABLE_SUFFIX = '_distributed'
 
     def __init__(self, database: str | None, clickhouse_settings: ClickhouseSettings, version_initial_value: int = 0):
         self.database = database
         self.clickhouse_settings = clickhouse_settings
         self.erase_batch_size = clickhouse_settings.erase_batch_size
+        self.max_unfinished_mutations_to_wait = clickhouse_settings.max_unfinished_mutations_to_wait
+        self.mutation_backpressure_sleep = clickhouse_settings.mutation_backpressure_sleep
         self.version_initial_value = version_initial_value
         self.client = clickhouse_connect.get_client(
             host=clickhouse_settings.host,
@@ -101,10 +105,11 @@ class ClickhouseApi:
             password=clickhouse_settings.password,
             connect_timeout=clickhouse_settings.connection_timeout,
             send_receive_timeout=clickhouse_settings.send_receive_timeout,
+            autogenerate_session_id=False,
+            settings={'final': 1},
         )
         self.tables_last_record_version = {}
         self.stats = GeneralStats()
-        self.execute_command('SET final = 1;')
 
     def get_stats(self):
         stats = self.stats.to_dict()
@@ -194,6 +199,57 @@ class ClickhouseApi:
                 if attempt == ClickhouseApi.MAX_RETRIES - 1:
                     raise e
                 time.sleep(ClickhouseApi.RETRY_INTERVAL)
+
+    def _is_too_many_mutations_error(self, exc):
+        return (
+            str(ClickhouseApi.TOO_MANY_MUTATIONS_ERROR_CODE) in str(exc) and
+            'TOO_MANY_MUTATIONS' in str(exc)
+        )
+
+    def _is_session_locked_error(self, exc):
+        return (
+            str(ClickhouseApi.SESSION_IS_LOCKED_ERROR_CODE) in str(exc) and
+            'SESSION_IS_LOCKED' in str(exc)
+        )
+
+    def _is_retryable_delete_error(self, exc):
+        return (
+            isinstance(exc, clickhouse_connect.driver.exceptions.OperationalError) or
+            self._is_too_many_mutations_error(exc) or
+            self._is_session_locked_error(exc)
+        )
+
+    def _escape_clickhouse_string(self, value):
+        return str(value).replace('\\', '\\\\').replace("'", "\\'")
+
+    def _get_unfinished_mutations_count(self, table_name):
+        database = self._escape_clickhouse_string(self.database)
+        table_name = self._escape_clickhouse_string(table_name)
+        query = (
+            "SELECT count() "
+            "FROM system.mutations "
+            f"WHERE database = '{database}' "
+            f"AND table = '{table_name}' "
+            "AND is_done = 0"
+        )
+        result = self.client.query(query)
+        if not result.result_rows:
+            return 0
+        return int(result.result_rows[0][0])
+
+    def _wait_for_mutation_backlog(self, table_name):
+        if self.max_unfinished_mutations_to_wait == 0:
+            return
+
+        while True:
+            unfinished_mutations = self._get_unfinished_mutations_count(table_name)
+            if unfinished_mutations < self.max_unfinished_mutations_to_wait:
+                return
+            logger.warning(
+                f'waiting for unfinished ClickHouse mutations on {self.database}.{table_name}: '
+                f'{unfinished_mutations} >= {self.max_unfinished_mutations_to_wait}'
+            )
+            time.sleep(self.mutation_backpressure_sleep)
 
     def recreate_database(self):
         self.drop_database(self.database)
@@ -387,10 +443,26 @@ class ClickhouseApi:
                 'field_values': batch_field_values,
             })
             
-            t1 = time.time()
-            self.execute_command(query)
-            t2 = time.time()
-            total_duration += (t2 - t1)
+            while True:
+                self._wait_for_mutation_backlog(table_name)
+                t1 = time.time()
+                try:
+                    self.execute_command(query)
+                except (
+                    clickhouse_connect.driver.exceptions.DatabaseError,
+                    clickhouse_connect.driver.exceptions.OperationalError,
+                ) as e:
+                    if not self._is_retryable_delete_error(e):
+                        raise
+                    logger.warning(
+                        f'ClickHouse delete mutation is blocked for {self.database}.{table_name}: {e}; '
+                        f'waiting {self.mutation_backpressure_sleep}s before retrying delete mutation'
+                    )
+                    time.sleep(self.mutation_backpressure_sleep)
+                    continue
+                t2 = time.time()
+                total_duration += (t2 - t1)
+                break
         
         self.stats.on_event(
             table_name=table_name,

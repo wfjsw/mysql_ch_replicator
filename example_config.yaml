@@ -15,6 +15,8 @@ clickhouse:
   port: 8323
   user: 'default'
   password: 'default'
+  max_unfinished_mutations_to_wait: 900  # Optional: wait before issuing more DELETE mutations when a table has this many unfinished mutations
+  mutation_backpressure_sleep: 10        # Optional: seconds to sleep while waiting for mutation backlog to drain
 
 binlog_replicator:
   data_dir: '/home/user/binlog/'

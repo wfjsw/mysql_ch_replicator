@@ -33,50 +33,54 @@ class DbReplicatorInitial:
     )
     MYSQL_SIMPLE_IDENTIFIER_RE = re.compile(r'^`?([A-Za-z_][A-Za-z0-9_]*)`?$')
     MYSQL_VOLATILE_TABLE_OPTIONS_RE = re.compile(r'\bAUTO_INCREMENT\s*=\s*\d+\b', re.IGNORECASE)
+    CURRENT_WORKER_SHARDING_MODE = 'split_points_v2'
 
     def __init__(self, replicator):
         self.replicator = replicator
         self.last_touch_time = 0
         self.last_save_state_time = 0
 
-    def migrate_crc32_state_if_needed(self):
-        """Detect and migrate state files written by the old CRC32 hash-sharding implementation.
+    def migrate_worker_sharding_state_if_needed(self):
+        """Migrate in-progress checkpoints between worker sharding strategies.
 
-        CRC32-era state files do not contain the 'worker_sharding_mode' key (it will be None
-        after loading).  If such a state exists AND an initial replication was in progress
-        (i.e. a table was partially processed), the checkpoint primary-key value is NOT safe to
-        reuse: the old worker only visited rows where ``CRC32(pk) % total_workers == worker_id``,
-        so many rows inside the new worker's contiguous PK range were never replicated.
+        Prior strategies are not safely interchangeable:
+        - legacy CRC32 hash sharding (state marker: None)
+        - legacy integer value-range sharding (state marker: 'range')
 
-        Migration:
-        - Completed tables (``initial_replication_completed_tables``) are kept — they are fully
-          replicated regardless of sharding strategy.
-        - The in-progress table cursor (``initial_replication_table`` /
-          ``initial_replication_max_primary_key`` / ``initial_replication_table_checkpoints``) is
-          cleared so the table is re-replicated from scratch under the new scheme.
-        - ``worker_sharding_mode`` is set to ``'range'`` so this migration never fires again.
+        The current strategy is row-balanced split-point sharding
+        (state marker: 'split_points_v2').
+
+        Completed tables are preserved.  If an in-progress table exists under an
+        incompatible strategy, we clear only that table's cursor/checkpoint so it
+        is re-replicated safely under the current strategy.
         """
         state = self.replicator.state
-        if state.worker_sharding_mode is not None:
-            # Already migrated or freshly created under the new scheme.
+        mode = state.worker_sharding_mode
+        if mode == self.CURRENT_WORKER_SHARDING_MODE:
+            # Already on current strategy.
             return
 
         in_progress_table = state.initial_replication_table
         if in_progress_table is not None:
+            mode_label = mode if mode is not None else 'crc32_legacy'
             logger.warning(
-                f'\n\n    !!! CRC32-era checkpoint detected for table "{in_progress_table}" !!!\n'
-                '    The old hash-based sharding checkpoint cannot be safely resumed with the\n'
-                '    new range-based sharding.  Resetting in-progress state for this table so\n'
-                '    it will be re-replicated from scratch.  Already-completed tables are kept.\n'
+                f'\n\n    !!! legacy sharding checkpoint detected for table "{in_progress_table}" !!!\n'
+                f'    Stored worker_sharding_mode={mode_label}.\n'
+                f'    Cannot safely resume under {self.CURRENT_WORKER_SHARDING_MODE}.\n'
+                '    Resetting in-progress state for this table so it will be re-replicated\n'
+                '    from scratch. Already-completed tables are kept.\n'
             )
             state.initial_replication_table = None
             state.initial_replication_max_primary_key = None
             state.initial_replication_table_checkpoints.pop(in_progress_table, None)
             state.initial_replication_replicated_rows.pop(in_progress_table, None)
 
-        state.worker_sharding_mode = 'range'
+        state.worker_sharding_mode = self.CURRENT_WORKER_SHARDING_MODE
         state.save()
-        logger.info('worker_sharding_mode set to "range"; CRC32 migration complete.')
+        logger.info(
+            f'worker_sharding_mode set to "{self.CURRENT_WORKER_SHARDING_MODE}"; '
+            'worker sharding migration complete.'
+        )
 
     def create_initial_structure(self):
         self.replicator.state.status = Status.CREATING_INITIAL_STRUCTURES
@@ -374,7 +378,7 @@ class DbReplicatorInitial:
             )
 
     def perform_initial_replication(self):
-        self.migrate_crc32_state_if_needed()
+        self.migrate_worker_sharding_state_if_needed()
         self.replicator.clickhouse_api.database = self.replicator.target_database_tmp
         logger.info('running initial replication')
         self.replicator.state.status = Status.PERFORMING_INITIAL_REPLICATION
@@ -475,95 +479,67 @@ class DbReplicatorInitial:
                     )
                     return
             else:
-                # Range-based sharding on the first primary key column.
-                # Each worker owns an exclusive, contiguous slice of the PK range so MySQL
-                # can satisfy the predicate via an index range scan instead of a full scan.
+                # Row-balanced sharding on the first primary key column.
+                # For both integer and string PKs, we derive split points from index order
+                # so worker slices are based on row positions rather than PK value ranges.
+                # This avoids heavy skew when integer PK values are sparse or unevenly
+                # distributed (e.g. large gaps or historical bursts).
                 pk_field = primary_keys[0] if primary_keys else None
                 pk_field_type = mysql_field_types.get(pk_field, '') if pk_field else ''
                 pk_is_integer = pk_field and 'int' in pk_field_type.lower()
 
-                if pk_is_integer:
-                    min_pk, max_pk = self.replicator.mysql_api.get_pk_bounds(table_name, pk_field)
-                    if min_pk is None:
-                        # Table is empty; all workers return immediately.
+                # Composite PKs (more than one column) are not split — worker 0 handles them.
+                if len(primary_keys) != 1:
+                    if intra_worker_id != 0:
                         logger.info(
                             f'Worker {intra_worker_id}/{intra_total_workers}: '
-                            f'table {table_name} is empty, nothing to do'
+                            f'composite PK on {table_name}, skipping (handled by worker 0)'
                         )
                         return
-                    total_range = max_pk - min_pk + 1
-                    range_start = min_pk + (intra_worker_id * total_range) // intra_total_workers
-                    excl_range_end = min_pk + ((intra_worker_id + 1) * total_range) // intra_total_workers
-                    range_end = excl_range_end - 1
-                    if range_start > range_end:
-                        logger.info(
-                            f'Worker {intra_worker_id}/{intra_total_workers}: '
-                            f'empty PK range for {table_name}, nothing to do'
-                        )
-                        return
-                    pk_range_where_conditions = [
-                        f'`{pk_field}` >= {range_start}',
-                        f'`{pk_field}` <= {range_end}',
-                    ]
                     logger.info(
-                        f'Worker {intra_worker_id}/{intra_total_workers}: '
-                        f'PK range [{range_start}, {range_end}] for {table_name}'
+                        f'Worker 0/{intra_total_workers}: '
+                        f'composite PK on {table_name}, processing as sole worker'
                     )
                 else:
-                    # Non-integer single-column PK (e.g. UUID / VARCHAR).
-                    # Divide the sorted PK space into N slices using sampled split points.
-                    # Split-point queries run once at startup so the OFFSET cost is acceptable.
-                    # Composite PKs (more than one column) are not split — worker 0 handles them.
-                    if len(primary_keys) != 1:
+                    split_points = self.replicator.mysql_api.get_pk_split_points(
+                        table_name, pk_field, intra_total_workers
+                    )
+                    logger.info(
+                        f'Worker {intra_worker_id}/{intra_total_workers}: '
+                        f'computed {len(split_points)} split points for {table_name} '
+                        f'(expected up to {max(0, intra_total_workers - 1)}), '
+                        f'pk_type={pk_field_type}, integer_pk={bool(pk_is_integer)}'
+                    )
+                    if not split_points:
+                        # Empty table or couldn't split — only worker 0 proceeds.
                         if intra_worker_id != 0:
                             logger.info(
                                 f'Worker {intra_worker_id}/{intra_total_workers}: '
-                                f'composite PK on {table_name}, skipping (handled by worker 0)'
+                                f'no split points for {table_name}, skipping'
+                            )
+                            return
+                    else:
+                        lower = split_points[intra_worker_id - 1] if intra_worker_id > 0 else None
+                        upper = split_points[intra_worker_id] if intra_worker_id < len(split_points) else None
+                        if lower is not None:
+                            pk_range_where_conditions.append(
+                                f'`{pk_field}` > {MySQLApi._quote_pk_value(lower)}'
+                            )
+                        if upper is not None:
+                            pk_range_where_conditions.append(
+                                f'`{pk_field}` <= {MySQLApi._quote_pk_value(upper)}'
+                            )
+                        if intra_worker_id >= len(split_points) + 1:
+                            # More workers than split points; this worker has no rows.
+                            logger.info(
+                                f'Worker {intra_worker_id}/{intra_total_workers}: '
+                                f'no slice assigned for {table_name}, skipping'
                             )
                             return
                         logger.info(
-                            f'Worker 0/{intra_total_workers}: '
-                            f'composite PK on {table_name}, processing as sole worker'
-                        )
-                    else:
-                        split_points = self.replicator.mysql_api.get_pk_split_points(
-                            table_name, pk_field, intra_total_workers
-                        )
-                        logger.info(
                             f'Worker {intra_worker_id}/{intra_total_workers}: '
-                            f'computed {len(split_points)} split points for {table_name} '
-                            f'(expected up to {max(0, intra_total_workers - 1)})'
+                            f'PK slice ({lower!r}, {upper!r}] for {table_name}'
                         )
-                        if not split_points:
-                            # Empty table or couldn't split — only worker 0 proceeds.
-                            if intra_worker_id != 0:
-                                logger.info(
-                                    f'Worker {intra_worker_id}/{intra_total_workers}: '
-                                    f'no split points for {table_name}, skipping'
-                                )
-                                return
-                        else:
-                            lower = split_points[intra_worker_id - 1] if intra_worker_id > 0 else None
-                            upper = split_points[intra_worker_id] if intra_worker_id < len(split_points) else None
-                            if lower is not None:
-                                pk_range_where_conditions.append(
-                                    f'`{pk_field}` > {MySQLApi._quote_pk_value(lower)}'
-                                )
-                            if upper is not None:
-                                pk_range_where_conditions.append(
-                                    f'`{pk_field}` <= {MySQLApi._quote_pk_value(upper)}'
-                                )
-                            if intra_worker_id >= len(split_points) + 1:
-                                # More workers than split points; this worker has no rows.
-                                logger.info(
-                                    f'Worker {intra_worker_id}/{intra_total_workers}: '
-                                    f'no slice assigned for {table_name}, skipping'
-                                )
-                                return
-                            logger.info(
-                                f'Worker {intra_worker_id}/{intra_total_workers}: '
-                                f'PK slice ({lower!r}, {upper!r}] for {table_name}'
-                            )
 
         table_checkpoint = self.replicator.state.initial_replication_table_checkpoints.get(table_name)
         has_legacy_checkpoint = (

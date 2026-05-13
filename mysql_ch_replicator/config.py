@@ -73,6 +73,8 @@ class ClickhouseSettings:
     connection_timeout: int = 30
     send_receive_timeout: int = 120
     erase_batch_size: int = 100000  # Number of records to delete per batch
+    max_unfinished_mutations_to_wait: int = 900
+    mutation_backpressure_sleep: int = 10
 
     def validate(self):
         if not isinstance(self.host, str):
@@ -106,6 +108,20 @@ class ClickhouseSettings:
             raise ValueError(f'erase_batch_size should be int and not {stype(self.erase_batch_size)}')
         if self.erase_batch_size <= 0:
             raise ValueError('erase_batch_size should be positive')
+
+        if not isinstance(self.max_unfinished_mutations_to_wait, int):
+            raise ValueError(
+                f'max_unfinished_mutations_to_wait should be int and not {stype(self.max_unfinished_mutations_to_wait)}'
+            )
+        if self.max_unfinished_mutations_to_wait < 0:
+            raise ValueError('max_unfinished_mutations_to_wait should be non-negative')
+
+        if not isinstance(self.mutation_backpressure_sleep, int):
+            raise ValueError(
+                f'mutation_backpressure_sleep should be int and not {stype(self.mutation_backpressure_sleep)}'
+            )
+        if self.mutation_backpressure_sleep <= 0:
+            raise ValueError('mutation_backpressure_sleep should be positive')
 
 
 @dataclass
