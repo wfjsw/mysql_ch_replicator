@@ -34,6 +34,7 @@ ENGINE = Distributed('{cluster}', '{db_name}', '{table_name}', rand());
 
 DELETE_QUERY = '''
 DELETE FROM `{db_name}`.`{table_name}` {on_cluster} WHERE ({field_name}) IN ({field_values})
+SETTINGS lightweight_deletes_sync = 0
 '''
 
 
@@ -302,15 +303,8 @@ class ClickhouseApi:
         fields = ',\n'.join(fields)
         partition_by = ''
 
-        # Check for custom partition_by first
         if additional_partition_bys:
-            # Use the first custom partition_by if available
             partition_by = f'PARTITION BY {additional_partition_bys[0]}\n'
-        else:
-            # Fallback to default logic
-            if len(structure.primary_keys) == 1:
-                if 'int' in structure.fields[structure.primary_key_ids[0]].field_type.lower():
-                    partition_by = f'PARTITION BY intDiv({structure.primary_keys[0]}, 4294967)\n'
 
         indexes = [
             'INDEX _version _version TYPE minmax GRANULARITY 1',

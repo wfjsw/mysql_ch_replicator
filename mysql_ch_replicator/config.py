@@ -153,6 +153,10 @@ class Settings:
     DEFAULT_CHECK_DB_UPDATED_INTERVAL = 120
     DEFAULT_AUTO_RESTART_INTERVAL = 3600
     DEFAULT_INITIAL_REPLICATION_BATCH_SIZE = 50000
+    DEFAULT_REALTIME_INSERT_FLUSH_INTERVAL = 1
+    DEFAULT_REALTIME_DELETE_FLUSH_INTERVAL = 60
+    DEFAULT_REALTIME_INSERT_FLUSH_BATCH_SIZE = 100000
+    DEFAULT_REALTIME_DELETE_FLUSH_BATCH_SIZE = 100000
     SIMPLE_IDENTIFIER_RE = re.compile(r'^`?([A-Za-z_][A-Za-z0-9_]*)`?$')
     SINGLE_ARG_FUNCTION_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?.*\)$')
 
@@ -187,6 +191,10 @@ class Settings:
         self.initial_replication_batch_size = 50000
         self.skip_initial_replication = False
         self.version_initial_value = 0
+        self.realtime_insert_flush_interval = Settings.DEFAULT_REALTIME_INSERT_FLUSH_INTERVAL
+        self.realtime_delete_flush_interval = Settings.DEFAULT_REALTIME_DELETE_FLUSH_INTERVAL
+        self.realtime_insert_flush_batch_size = Settings.DEFAULT_REALTIME_INSERT_FLUSH_BATCH_SIZE
+        self.realtime_delete_flush_batch_size = Settings.DEFAULT_REALTIME_DELETE_FLUSH_BATCH_SIZE
 
     def load(self, settings_file):
         data = open(settings_file, 'r').read()
@@ -224,6 +232,18 @@ class Settings:
         self.initial_replication_batch_size = data.pop('initial_replication_batch_size', Settings.DEFAULT_INITIAL_REPLICATION_BATCH_SIZE)
         self.skip_initial_replication = data.pop('skip_initial_replication', False)
         self.version_initial_value = data.pop('version_initial_value', 0)
+        self.realtime_insert_flush_interval = data.pop(
+            'realtime_insert_flush_interval', Settings.DEFAULT_REALTIME_INSERT_FLUSH_INTERVAL,
+        )
+        self.realtime_delete_flush_interval = data.pop(
+            'realtime_delete_flush_interval', Settings.DEFAULT_REALTIME_DELETE_FLUSH_INTERVAL,
+        )
+        self.realtime_insert_flush_batch_size = data.pop(
+            'realtime_insert_flush_batch_size', Settings.DEFAULT_REALTIME_INSERT_FLUSH_BATCH_SIZE,
+        )
+        self.realtime_delete_flush_batch_size = data.pop(
+            'realtime_delete_flush_batch_size', Settings.DEFAULT_REALTIME_DELETE_FLUSH_BATCH_SIZE,
+        )
 
         indexes = data.pop('indexes', [])
         for index in indexes:
@@ -442,4 +462,28 @@ class Settings:
             raise ValueError(f'version_initial_value should be an integer, not {type(self.version_initial_value)}')
         if self.version_initial_value < 0:
             raise ValueError(f'version_initial_value should be non-negative')
+        if not isinstance(self.realtime_insert_flush_interval, int):
+            raise ValueError(
+                f'realtime_insert_flush_interval should be an integer, not {type(self.realtime_insert_flush_interval)}'
+            )
+        if self.realtime_insert_flush_interval <= 0:
+            raise ValueError('realtime_insert_flush_interval should be positive')
+        if not isinstance(self.realtime_delete_flush_interval, int):
+            raise ValueError(
+                f'realtime_delete_flush_interval should be an integer, not {type(self.realtime_delete_flush_interval)}'
+            )
+        if self.realtime_delete_flush_interval <= 0:
+            raise ValueError('realtime_delete_flush_interval should be positive')
+        if not isinstance(self.realtime_insert_flush_batch_size, int):
+            raise ValueError(
+                f'realtime_insert_flush_batch_size should be an integer, not {type(self.realtime_insert_flush_batch_size)}'
+            )
+        if self.realtime_insert_flush_batch_size <= 0:
+            raise ValueError('realtime_insert_flush_batch_size should be positive')
+        if not isinstance(self.realtime_delete_flush_batch_size, int):
+            raise ValueError(
+                f'realtime_delete_flush_batch_size should be an integer, not {type(self.realtime_delete_flush_batch_size)}'
+            )
+        if self.realtime_delete_flush_batch_size <= 0:
+            raise ValueError('realtime_delete_flush_batch_size should be positive')
         self.validate_mysql_timezone()

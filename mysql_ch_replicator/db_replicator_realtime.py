@@ -19,8 +19,6 @@ class DbReplicatorRealtime:
     SAVE_STATE_INTERVAL = 10
     STATS_DUMP_INTERVAL = 60
     BINLOG_TOUCH_INTERVAL = 120
-    DATA_DUMP_INTERVAL = 1
-    DATA_DUMP_BATCH_SIZE = 100000
     READ_LOG_INTERVAL = 0.3
 
     def __init__(self, replicator):
@@ -32,7 +30,8 @@ class DbReplicatorRealtime:
         self.last_save_state_time = 0
         self.last_dump_stats_time = 0
         self.last_dump_stats_process_time = 0
-        self.last_records_upload_time = 0
+        self.last_insert_upload_time = 0
+        self.last_delete_upload_time = 0
         self.start_time = time.time()
 
     def run_realtime_replication(self):
@@ -100,7 +99,7 @@ class DbReplicatorRealtime:
         self.replicator.stats.last_transaction = event.transaction_id
         self.replicator.state.last_processed_transaction_non_uploaded = event.transaction_id
 
-        self.upload_records_if_required(table_name=event.table_name)
+        self.upload_records_if_required(table_name=event.table_name, can_flush_deletes=True)
 
         self.save_state_if_required()
         self.log_stats_if_required()
@@ -184,18 +183,18 @@ class DbReplicatorRealtime:
             logger.debug(f'processing query event: {event.transaction_id}, query: {event.records}')
         query = strip_sql_comments(event.records)
         if query.lower().startswith('alter'):
-            self.upload_records()
+            self.upload_records(can_flush_deletes=True)
             self.handle_alter_query(query, event.db_name)
         if query.lower().startswith('create table'):
             self.handle_create_table_query(query, event.db_name)
         if query.lower().startswith('drop table'):
-            self.upload_records()
+            self.upload_records(can_flush_deletes=True)
             self.handle_drop_table_query(query, event.db_name)
         if query.lower().startswith('rename table'):
-            self.upload_records()
+            self.upload_records(can_flush_deletes=True)
             self.handle_rename_table_query(query, event.db_name)
         if query.lower().startswith('truncate'):
-            self.upload_records()
+            self.upload_records(can_flush_deletes=True)
             self.handle_truncate_query(query, event.db_name)
 
     def handle_alter_query(self, query, db_name):
@@ -324,54 +323,78 @@ class DbReplicatorRealtime:
         # Reset stats for next period - reuse parent's stats object
         self.replicator.stats = type(self.replicator.stats)()
 
-    def upload_records_if_required(self, table_name):
-        need_dump = False
-        if table_name is not None:
-            if len(self.records_to_insert[table_name]) >= self.DATA_DUMP_BATCH_SIZE:
-                need_dump = True
-            if len(self.records_to_delete[table_name]) >= self.DATA_DUMP_BATCH_SIZE:
-                need_dump = True
-
+    def upload_records_if_required(self, table_name, can_flush_deletes=None):
+        need_insert_dump = False
+        need_delete_dump = False
         curr_time = time.time()
-        if curr_time - self.last_records_upload_time >= self.DATA_DUMP_INTERVAL:
-            need_dump = True
+        has_pending_inserts = any(self.records_to_insert.values())
+        has_pending_deletes = any(self.records_to_delete.values())
 
-        if not need_dump:
+        if table_name is not None:
+            if len(self.records_to_insert[table_name]) >= self.replicator.config.realtime_insert_flush_batch_size:
+                need_insert_dump = True
+            if len(self.records_to_delete[table_name]) >= self.replicator.config.realtime_delete_flush_batch_size:
+                need_delete_dump = True
+
+        if (
+            has_pending_inserts and
+            curr_time - self.last_insert_upload_time >= self.replicator.config.realtime_insert_flush_interval
+        ):
+            need_insert_dump = True
+        if (
+            has_pending_deletes and
+            curr_time - self.last_delete_upload_time >= self.replicator.config.realtime_delete_flush_interval
+        ):
+            need_delete_dump = True
+
+        if can_flush_deletes is None:
+            can_flush_deletes = need_delete_dump
+
+        if not need_insert_dump and not (need_delete_dump and can_flush_deletes):
             return
 
-        self.upload_records()
+        self.upload_records(can_flush_inserts=need_insert_dump, can_flush_deletes=need_delete_dump and can_flush_deletes)
 
-    def upload_records(self):
+    def upload_records(self, can_flush_inserts=True, can_flush_deletes=True):
         logger.debug(
             f'upload records, to insert: {len(self.records_to_insert)}, to delete: {len(self.records_to_delete)}',
         )
-        self.last_records_upload_time = time.time()
 
-        for table_name, id_to_records in self.records_to_insert.items():
-            records = id_to_records.values()
-            if not records:
-                continue
-            _, ch_table_structure = self.replicator.state.tables_structure[table_name]
-            target_table_name = self.replicator.get_target_table_name(table_name)
-            if self.replicator.config.debug_log_level:
-                logger.debug(f'inserting into {target_table_name}, records: {records}')
-            self.replicator.clickhouse_api.insert(target_table_name, records, table_structure=ch_table_structure)
+        if can_flush_inserts:
+            for table_name, id_to_records in list(self.records_to_insert.items()):
+                records = list(id_to_records.values())
+                if not records:
+                    continue
+                _, ch_table_structure = self.replicator.state.tables_structure[table_name]
+                target_table_name = self.replicator.get_target_table_name(table_name)
+                if self.replicator.config.debug_log_level:
+                    logger.debug(f'inserting into {target_table_name}, records: {records}')
+                self.replicator.clickhouse_api.insert(target_table_name, records, table_structure=ch_table_structure)
+                self.records_to_insert[table_name].clear()
+            self.last_insert_upload_time = time.time()
 
-        for table_name, keys_to_remove in self.records_to_delete.items():
-            if not keys_to_remove:
-                continue
-            table_structure: TableStructure = self.replicator.state.tables_structure[table_name][0]
-            primary_key_names = table_structure.primary_keys
-            target_table_name = self.replicator.get_target_table_name(table_name)
-            if self.replicator.config.debug_log_level:
-                logger.debug(f'erasing from {target_table_name}, primary key: {primary_key_names}, values: {keys_to_remove}')
-            self.replicator.clickhouse_api.erase(
-                table_name=target_table_name,
-                field_name=primary_key_names,
-                field_values=keys_to_remove,
-            )
+        if can_flush_deletes:
+            for table_name, keys_to_remove in list(self.records_to_delete.items()):
+                if not keys_to_remove:
+                    continue
+                table_structure: TableStructure = self.replicator.state.tables_structure[table_name][0]
+                primary_key_names = table_structure.primary_keys
+                target_table_name = self.replicator.get_target_table_name(table_name)
+                if self.replicator.config.debug_log_level:
+                    logger.debug(f'erasing from {target_table_name}, primary key: {primary_key_names}, values: {keys_to_remove}')
+                self.replicator.clickhouse_api.erase(
+                    table_name=target_table_name,
+                    field_name=primary_key_names,
+                    field_values=keys_to_remove,
+                )
+                self.records_to_delete[table_name].clear()
+            self.last_delete_upload_time = time.time()
 
-        self.records_to_insert = defaultdict(dict)  # table_name => {record_id=>record, ...}
-        self.records_to_delete = defaultdict(set)  # table_name => {record_id, ...}
-        self.replicator.state.last_processed_transaction = self.replicator.state.last_processed_transaction_non_uploaded
-        self.save_state_if_required()
+        if not self.has_pending_records():
+            self.replicator.state.last_processed_transaction = self.replicator.state.last_processed_transaction_non_uploaded
+            self.save_state_if_required()
+        elif can_flush_inserts:
+            logger.debug('state position is not advanced because realtime delete records are still buffered')
+
+    def has_pending_records(self):
+        return any(self.records_to_insert.values()) or any(self.records_to_delete.values())
