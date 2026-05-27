@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from mysql_ch_replicator import db_replicator_initial
 from mysql_ch_replicator.db_replicator_initial import DbReplicatorInitial
+from mysql_ch_replicator.table_structure import TableField, TableStructure
 
 
 class _ImmediateProcess:
@@ -37,6 +38,21 @@ class _DummyClickHouseApi:
 
     def get_max_record_version(self, table_name):
         return 0
+
+
+class _SplitPointMysqlApi:
+    def get_table_create_statement(self, table_name):
+        return (
+            f'CREATE TABLE `{table_name}` ('
+            '`id` int NOT NULL, '
+            'PRIMARY KEY (`id`)) ENGINE=InnoDB'
+        )
+
+    def get_pk_split_points(self, table_name, primary_key, total_workers):
+        return [100]
+
+    def get_records(self, **kwargs):
+        raise AssertionError('worker without an assigned slice must not query records')
 
 
 def _make_initial_replicator(threads, tmp_path):
@@ -78,6 +94,18 @@ def _create_worker_state_file(db_dir, table_name, worker_id, total_workers):
     table_hash = hashlib.sha256(table_name.encode('utf-8')).hexdigest()[:16]
     state_path = db_dir / f'state_worker_{worker_id}_of_{total_workers}_{table_hash}.pckl'
     state_path.write_bytes(b'checkpoint')
+
+
+def _build_single_id_table_structure(table_name):
+    structure = TableStructure(
+        table_name=table_name,
+        fields=[
+            TableField(name='id', field_type='int', parameters='NOT NULL'),
+        ],
+        primary_keys=['id'],
+    )
+    structure.preprocess()
+    return structure
 
 
 def test_parallel_scheduler_uses_one_worker_per_table_when_tables_fill_pool(monkeypatch, tmp_path):
@@ -154,3 +182,40 @@ def test_parallel_scheduler_skips_parent_recorded_completed_workers(monkeypatch,
     assert state.initial_replication_completed_tables == ['table_1']
     assert state.initial_replication_parallel_worker_counts == {}
     assert state.initial_replication_parallel_completed_workers == {}
+
+
+def test_table_worker_with_no_split_point_slice_returns_without_index_error(tmp_path):
+    table_name = 'table_billing_payees'
+    state = _DummyState()
+    state.initial_replication_structure_signatures = {}
+    state.tables_structure = {
+        table_name: (
+            _build_single_id_table_structure(table_name),
+            _build_single_id_table_structure(table_name),
+        ),
+    }
+
+    replicator = SimpleNamespace(
+        config=SimpleNamespace(
+            initial_replication_threads=4,
+            initial_replication_batch_size=10,
+            debug_log_level=False,
+            is_table_matches=lambda _: True,
+            binlog_replicator=SimpleNamespace(data_dir=str(tmp_path / 'binlog')),
+        ),
+        worker_id=2,
+        total_workers=4,
+        state=state,
+        mysql_api=_SplitPointMysqlApi(),
+        converter=SimpleNamespace(),
+        clickhouse_api=_DummyClickHouseApi(),
+        is_parallel_worker=True,
+        initial_replication_test_fail_records=None,
+        get_target_table_name=lambda source_table: source_table,
+    )
+    initial = DbReplicatorInitial(replicator)
+
+    initial.perform_initial_replication_table(table_name)
+
+    assert state.initial_replication_table is None
+    assert state.initial_replication_completed_tables == []

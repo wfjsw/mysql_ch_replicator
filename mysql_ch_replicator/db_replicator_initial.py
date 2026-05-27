@@ -522,6 +522,13 @@ class DbReplicatorInitial:
                             )
                             return
                     else:
+                        if intra_worker_id >= len(split_points) + 1:
+                            # More workers than split points; this worker has no rows.
+                            logger.info(
+                                f'Worker {intra_worker_id}/{intra_total_workers}: '
+                                f'no slice assigned for {table_name}, skipping'
+                            )
+                            return
                         lower = split_points[intra_worker_id - 1] if intra_worker_id > 0 else None
                         upper = split_points[intra_worker_id] if intra_worker_id < len(split_points) else None
                         if lower is not None:
@@ -532,13 +539,6 @@ class DbReplicatorInitial:
                             pk_range_where_conditions.append(
                                 f'`{pk_field}` <= {MySQLApi._quote_pk_value(upper)}'
                             )
-                        if intra_worker_id >= len(split_points) + 1:
-                            # More workers than split points; this worker has no rows.
-                            logger.info(
-                                f'Worker {intra_worker_id}/{intra_total_workers}: '
-                                f'no slice assigned for {table_name}, skipping'
-                            )
-                            return
                         logger.info(
                             f'Worker {intra_worker_id}/{intra_total_workers}: '
                             f'PK slice ({lower!r}, {upper!r}] for {table_name}'
