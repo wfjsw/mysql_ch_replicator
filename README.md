@@ -264,6 +264,11 @@ optimize_interval: 86400        # optional
 enable_optimize_final: True     # optional 
 auto_restart_interval: 3600     # optional
 
+realtime_insert_flush_interval: 1       # optional, seconds between realtime insert flushes
+realtime_delete_flush_interval: 60      # optional, seconds between realtime delete flushes
+realtime_insert_flush_batch_size: 100000  # optional, buffered records that force an insert flush
+realtime_delete_flush_batch_size: 100000  # optional, buffered primary keys that force a delete flush
+
 indexes:                        # optional
   - databases: '*'
     tables: ['test_table']
@@ -311,9 +316,13 @@ version_initial_value: 0  # optional, initial value for _version column (default
 - `optimize_interval` - interval (seconds) between automatic `OPTIMIZE table` calls. Default 86400 (1 day). This is required to perform all merges guaranteed and avoid increasing of used storage and decreasing performance.
 - `enable_optimize_final` - (enabled by default) It forces ClickHouse to merge all active parts into a single part, even if large merges have already occurred. Although clickhouse documentation does NOT recommend this but we have observed [performance degradation](https://github.com/bakwc/mysql_ch_replicator/pull/223#discussion_r2659007677) and hence decided to enable it by default. Read more: https://clickhouse.com/docs/optimize/avoidoptimizefinal. You can turn it off.
 - `auto_restart_interval` - interval (seconds) between automatic db_replicator restart. Default 3600 (1 hour). This is done to reduce memory usage.
+- `realtime_insert_flush_interval` - interval in seconds between realtime insert flushes. Default 1.
+- `realtime_delete_flush_interval` - interval in seconds between realtime delete flushes. Default 60. Raising this reduces ClickHouse delete mutation frequency by batching more primary keys into each mutation.
+- `realtime_insert_flush_batch_size` - number of buffered insert records that forces an immediate insert flush. Default 100000.
+- `realtime_delete_flush_batch_size` - number of buffered delete primary keys that forces an immediate delete flush. Default 100000.
 - `binlog_retention_period` - how long to keep binlog files in seconds. Default 43200 (12 hours). This setting controls how long the local binlog files are retained before being automatically cleaned up.
 - `indexes` - you may want to add some indexes to accelerate performance, eg. ngram index for full-test search, etc. To apply indexes you need to start replication from scratch.
-- `partition_bys` - custom PARTITION BY expressions for tables. By default uses `intDiv(id, 4294967)` for integer primary keys. Useful for time-based partitioning like `toYYYYMM(created_at)`.
+- `partition_bys` - custom PARTITION BY expressions for tables. By default the replicator does not add a `PARTITION BY` clause, so ClickHouse uses a single logical partition. Configure this only for low-cardinality partitioning needs such as time-based retention, e.g. `toYYYYMM(created_at)`.
 - `order_bys` - custom ORDER BY expressions for tables. By default uses the MySQL primary key(s). Useful for optimizing query patterns, e.g., `created_at, id` for time-series data.
 - `http_host`, `http_port` - http endpoint to control replication, use `/docs` for abailable commands
 - `types_mappings` - custom types mapping, eg. you can map char(36) to UUID instead of String, etc.

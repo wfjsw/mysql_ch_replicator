@@ -33,6 +33,7 @@ class DbReplicatorInitial:
     )
     MYSQL_SIMPLE_IDENTIFIER_RE = re.compile(r'^`?([A-Za-z_][A-Za-z0-9_]*)`?$')
     MYSQL_VOLATILE_TABLE_OPTIONS_RE = re.compile(r'\bAUTO_INCREMENT\s*=\s*\d+\b', re.IGNORECASE)
+    WORKER_STATE_FILE_RE = re.compile(r'^state_worker_(\d+)_of_(\d+)_([0-9a-f]{16})\.pckl$')
     CURRENT_WORKER_SHARDING_MODE = 'split_points_v2'
 
     def __init__(self, replicator):
@@ -294,6 +295,8 @@ class DbReplicatorInitial:
     def mark_table_completed(self, table_name):
         if table_name not in self.replicator.state.initial_replication_completed_tables:
             self.replicator.state.initial_replication_completed_tables.append(table_name)
+        self.replicator.state.initial_replication_parallel_worker_counts.pop(table_name, None)
+        self.replicator.state.initial_replication_parallel_completed_workers.pop(table_name, None)
         self.replicator.state.initial_replication_table_checkpoints.pop(table_name, None)
         self.replicator.state.initial_replication_max_primary_key = None
         self.replicator.state.initial_replication_table = None
@@ -752,11 +755,10 @@ class DbReplicatorInitial:
         """
         Execute initial replication using multiple worker processes.
 
-                Workers are scheduled against a global slot pool of size
-                `initial_replication_threads`. Each table owns worker shards
-                `0..initial_replication_threads-1`, and workers are launched dynamically as
-                slots free up. This keeps total concurrency stable and allows multiple tables
-                to continue in parallel even when remaining tables are fewer than threads.
+        Workers are scheduled against a global slot pool of size
+        `initial_replication_threads`. When there are enough tables to occupy the
+        pool, each table gets one worker. Only when there are fewer tables than
+        worker slots do we split tables across multiple worker shards.
         """
         if not table_names:
             return
@@ -770,12 +772,23 @@ class DbReplicatorInitial:
         already_completed = len(self.replicator.state.initial_replication_completed_tables)
         total_tables = len(table_names) + already_completed
         last_progress_log_time = 0.0
+        worker_counts = self.get_parallel_worker_counts(table_names, threads)
+        self.save_parallel_worker_plan(worker_counts)
 
         table_states = {
             table_name: {
-                'pending_worker_ids': list(range(threads)),
+                'total_workers': worker_counts[table_name],
+                'pending_worker_ids': [
+                    worker_id
+                    for worker_id in range(worker_counts[table_name])
+                    if worker_id not in self.get_completed_parallel_worker_ids(
+                        table_name, worker_counts[table_name],
+                    )
+                ],
                 'running_workers': 0,
-                'completed_workers': 0,
+                'completed_workers': len(self.get_completed_parallel_worker_ids(
+                    table_name, worker_counts[table_name],
+                )),
             }
             for table_name in remaining
         }
@@ -791,19 +804,20 @@ class DbReplicatorInitial:
             ]
 
         def launch_worker(table_name, worker_id):
+            total_workers = table_states[table_name]['total_workers']
             cmd = [
                 sys.executable, "-m", "mysql_ch_replicator.main",
                 "db_replicator",
                 "--config", self.replicator.settings_file,
                 "--db", self.replicator.database,
                 "--worker_id", str(worker_id),
-                "--total_workers", str(threads),
+                "--total_workers", str(total_workers),
                 "--table", table_name,
                 "--target_db", self.replicator.target_database_tmp,
                 "--initial_only=True",
             ]
             logger.info(
-                f"Launching worker {worker_id}/{threads} for table {table_name}: {' '.join(cmd)}"
+                f"Launching worker {worker_id}/{total_workers} for table {table_name}: {' '.join(cmd)}"
             )
             process = subprocess.Popen(cmd)
             active_processes.append({
@@ -812,6 +826,39 @@ class DbReplicatorInitial:
                 'process': process,
             })
             table_states[table_name]['running_workers'] += 1
+
+        def finish_table(table_name):
+            logger.info(f"All workers completed for table {table_name}")
+            self.consolidate_worker_record_versions(table_name)
+            self.mark_table_completed(table_name)
+            self.save_state_if_required(force=True)
+            remaining.remove(table_name)
+
+            completed_tables = already_completed + (len(table_names) - len(remaining))
+            completed_table_names = set(self.replicator.state.initial_replication_completed_tables)
+            completed_table_names.update(t for t in table_names if t not in remaining)
+            completed_estimate = sum(
+                self.replicator.state.initial_replication_row_estimates.get(t, 0)
+                for t in completed_table_names
+            )
+            total_estimate = sum(self.replicator.state.initial_replication_row_estimates.values())
+            if total_estimate > 0:
+                pct = completed_estimate / total_estimate * 100.0
+                logger.info(
+                    f'Progress: {completed_tables}/{total_tables} tables done, '
+                    f'~{completed_estimate}/{total_estimate} rows ({pct:.1f}%)'
+                )
+            else:
+                logger.info(
+                    f'Progress: {completed_tables}/{total_tables} tables done'
+                )
+
+        for table_name in remaining[:]:
+            if (
+                table_states[table_name]['completed_workers'] ==
+                table_states[table_name]['total_workers']
+            ):
+                finish_table(table_name)
 
         try:
             while remaining or active_processes:
@@ -828,6 +875,12 @@ class DbReplicatorInitial:
                     worker_id = table_states[selected_table]['pending_worker_ids'].pop(0)
                     launch_worker(selected_table, worker_id)
 
+                if remaining and not active_processes and not get_launch_candidate_tables():
+                    raise Exception(
+                        'No pending parallel workers remain, but initial replication tables '
+                        f'are still unfinished: {remaining}'
+                    )
+
                 # Handle completed workers.
                 for ap in active_processes[:]:
                     if ap['process'].poll() is None:
@@ -841,7 +894,8 @@ class DbReplicatorInitial:
 
                     if exit_code != 0:
                         logger.error(
-                            f"Worker {worker_id}/{threads} for table {table_name} failed with exit code {exit_code}"
+                            f"Worker {worker_id}/{table_states[table_name]['total_workers']} "
+                            f"for table {table_name} failed with exit code {exit_code}"
                         )
                         for pending in active_processes:
                             pending['process'].terminate()
@@ -849,37 +903,22 @@ class DbReplicatorInitial:
                             f"Worker process for table {table_name} failed with exit code {exit_code}"
                         )
 
-                    logger.info(f"Worker {worker_id}/{threads} completed for table {table_name}")
+                    logger.info(
+                        f"Worker {worker_id}/{table_states[table_name]['total_workers']} "
+                        f"completed for table {table_name}"
+                    )
+                    self.mark_parallel_worker_completed(
+                        table_name=table_name,
+                        worker_id=worker_id,
+                        total_workers=table_states[table_name]['total_workers'],
+                    )
                     table_states[table_name]['completed_workers'] += 1
 
-                    if table_states[table_name]['completed_workers'] == threads:
-                        logger.info(f"All workers completed for table {table_name}")
-                        self.consolidate_worker_record_versions(table_name)
-                        self.mark_table_completed(table_name)
-                        self.save_state_if_required(force=True)
-                        remaining.remove(table_name)
-
-                        # Log table-level progress
-                        completed_tables = already_completed + (len(table_names) - len(remaining))
-                        completed_estimate = sum(
-                            self.replicator.state.initial_replication_row_estimates.get(t, 0)
-                            for t in table_names
-                            if t not in remaining
-                        )
-                        # Add estimates for already-completed tables
-                        for t in self.replicator.state.initial_replication_completed_tables:
-                            completed_estimate += self.replicator.state.initial_replication_row_estimates.get(t, 0)
-                        total_estimate = sum(self.replicator.state.initial_replication_row_estimates.values())
-                        if total_estimate > 0:
-                            pct = completed_estimate / total_estimate * 100.0
-                            logger.info(
-                                f'Progress: {completed_tables}/{total_tables} tables done, '
-                                f'~{completed_estimate}/{total_estimate} rows ({pct:.1f}%)'
-                            )
-                        else:
-                            logger.info(
-                                f'Progress: {completed_tables}/{total_tables} tables done'
-                            )
+                    if (
+                        table_states[table_name]['completed_workers'] ==
+                        table_states[table_name]['total_workers']
+                    ):
+                        finish_table(table_name)
 
                 if active_processes:
                     time.sleep(0.1)
@@ -897,7 +936,133 @@ class DbReplicatorInitial:
             raise
 
         logger.info("All workers completed initial replication")
-        
+
+    def save_parallel_worker_plan(self, worker_counts):
+        changed = False
+        for table_name, worker_count in worker_counts.items():
+            saved_worker_count = self.replicator.state.initial_replication_parallel_worker_counts.get(table_name)
+            if saved_worker_count == worker_count:
+                continue
+
+            if saved_worker_count is not None:
+                logger.warning(
+                    f'Parallel worker plan changed for {table_name}: '
+                    f'{saved_worker_count} -> {worker_count}; resetting completed worker ids'
+                )
+                self.replicator.state.initial_replication_parallel_completed_workers.pop(table_name, None)
+
+            self.replicator.state.initial_replication_parallel_worker_counts[table_name] = worker_count
+            changed = True
+
+        if changed:
+            self.replicator.state.save()
+
+    def mark_parallel_worker_completed(self, table_name, worker_id, total_workers):
+        self.replicator.state.initial_replication_parallel_worker_counts[table_name] = total_workers
+        completed_worker_ids = set(
+            self.replicator.state.initial_replication_parallel_completed_workers.get(table_name, [])
+        )
+        completed_worker_ids.add(worker_id)
+        self.replicator.state.initial_replication_parallel_completed_workers[table_name] = sorted(
+            completed_worker_ids
+        )
+        self.replicator.state.save()
+
+    def get_completed_parallel_worker_ids(self, table_name, total_workers):
+        saved_worker_count = self.replicator.state.initial_replication_parallel_worker_counts.get(table_name)
+        if saved_worker_count != total_workers:
+            return set()
+        completed_worker_ids = set()
+        for worker_id in self.replicator.state.initial_replication_parallel_completed_workers.get(table_name, []):
+            try:
+                worker_id = int(worker_id)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= worker_id < total_workers:
+                completed_worker_ids.add(worker_id)
+        return completed_worker_ids
+
+    def get_parallel_worker_counts(self, table_names, threads):
+        if not table_names:
+            return {}
+
+        existing_worker_counts = {
+            table_name: self.get_existing_parallel_worker_count(table_name)
+            for table_name in table_names
+        }
+
+        planned_counts = {}
+        unplanned_tables = []
+        for table_name in table_names:
+            saved_worker_count = self.replicator.state.initial_replication_parallel_worker_counts.get(table_name)
+            existing_worker_count = saved_worker_count or existing_worker_counts[table_name]
+            if existing_worker_count is None:
+                unplanned_tables.append(table_name)
+            else:
+                planned_counts[table_name] = existing_worker_count
+                if saved_worker_count:
+                    logger.info(
+                        f'Found saved parallel worker plan for {table_name}; '
+                        f'continuing with {existing_worker_count} worker shards'
+                    )
+                else:
+                    logger.info(
+                        f'Found existing parallel worker state for {table_name}; '
+                        f'continuing with {existing_worker_count} worker shards'
+                    )
+
+        if not unplanned_tables:
+            return planned_counts
+
+        if len(table_names) >= threads:
+            planned_counts.update({table_name: 1 for table_name in unplanned_tables})
+            return planned_counts
+
+        already_reserved_workers = sum(planned_counts.values())
+        available_workers = max(1, threads - already_reserved_workers)
+        if len(unplanned_tables) >= available_workers:
+            planned_counts.update({table_name: 1 for table_name in unplanned_tables})
+            return planned_counts
+
+        base_workers = available_workers // len(unplanned_tables)
+        extra_workers = available_workers % len(unplanned_tables)
+        planned_counts.update({
+            table_name: base_workers + (1 if idx < extra_workers else 0)
+            for idx, table_name in enumerate(unplanned_tables)
+        })
+        return planned_counts
+
+    def get_existing_parallel_worker_count(self, table_name):
+        table_hash = self.get_parallel_worker_state_table_hash(table_name)
+        db_dir = os.path.join(
+            self.replicator.config.binlog_replicator.data_dir,
+            self.replicator.database,
+        )
+        if not os.path.isdir(db_dir):
+            return None
+
+        total_workers = set()
+        for file_name in os.listdir(db_dir):
+            match = self.WORKER_STATE_FILE_RE.match(file_name)
+            if not match:
+                continue
+            if match.group(3) != table_hash:
+                continue
+            total_workers.add(int(match.group(2)))
+
+        if not total_workers:
+            return None
+
+        if len(total_workers) > 1:
+            logger.warning(
+                f'Multiple worker shard counts found for {table_name}: '
+                f'{sorted(total_workers)}. Using the largest count for resume.'
+            )
+        return max(total_workers)
+
+    def get_parallel_worker_state_table_hash(self, table_name):
+        return hashlib.sha256(table_name.encode('utf-8')).hexdigest()[:16]
+
     def consolidate_worker_record_versions(self, table_name):
         """
         Query ClickHouse directly to get the maximum record version for the specified table

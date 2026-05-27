@@ -43,6 +43,8 @@ class State:
         self.initial_replication_table_checkpoints = {}
         self.initial_replication_structure_signatures = {}
         self.initial_replication_completed_tables = []
+        self.initial_replication_parallel_worker_counts = {}
+        self.initial_replication_parallel_completed_workers = {}
         self.initial_replication_row_estimates = {}
         self.initial_replication_replicated_rows = {}
         # Sharding strategy marker for initial-replication worker checkpoints.
@@ -69,6 +71,8 @@ class State:
         self.initial_replication_table_checkpoints = data.get('initial_replication_table_checkpoints', {})
         self.initial_replication_structure_signatures = data.get('initial_replication_structure_signatures', {})
         self.initial_replication_completed_tables = data.get('initial_replication_completed_tables', [])
+        self.initial_replication_parallel_worker_counts = data.get('initial_replication_parallel_worker_counts', {})
+        self.initial_replication_parallel_completed_workers = data.get('initial_replication_parallel_completed_workers', {})
         self.initial_replication_row_estimates = data.get('initial_replication_row_estimates', {})
         self.initial_replication_replicated_rows = data.get('initial_replication_replicated_rows', {})
         self.worker_sharding_mode = data.get('worker_sharding_mode', None)
@@ -87,6 +91,8 @@ class State:
             'initial_replication_table_checkpoints': self.initial_replication_table_checkpoints,
             'initial_replication_structure_signatures': self.initial_replication_structure_signatures,
             'initial_replication_completed_tables': self.initial_replication_completed_tables,
+            'initial_replication_parallel_worker_counts': self.initial_replication_parallel_worker_counts,
+            'initial_replication_parallel_completed_workers': self.initial_replication_parallel_completed_workers,
             'initial_replication_row_estimates': self.initial_replication_row_estimates,
             'initial_replication_replicated_rows': self.initial_replication_replicated_rows,
             'worker_sharding_mode': self.worker_sharding_mode,

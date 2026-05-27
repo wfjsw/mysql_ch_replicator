@@ -23,3 +23,8 @@ binlog_replicator:
   records_per_file: 100000
 
 databases: 'database_name_pattern_*'
+
+realtime_insert_flush_interval: 1        # Optional: seconds between realtime insert flushes
+realtime_delete_flush_interval: 60       # Optional: seconds between realtime delete flushes; increase to reduce ClickHouse mutation frequency
+realtime_insert_flush_batch_size: 100000 # Optional: buffered records that force an insert flush
+realtime_delete_flush_batch_size: 100000 # Optional: buffered primary keys that force a delete flush
