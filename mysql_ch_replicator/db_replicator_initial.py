@@ -409,23 +409,57 @@ class DbReplicatorInitial:
             )
             
             if not should_skip_db_swap:
-                logger.info(f'initial replication - swapping database')
-                if self.replicator.target_database in self.replicator.clickhouse_api.get_databases():
-                    self.replicator.clickhouse_api.execute_command(
-                        f'RENAME DATABASE `{self.replicator.target_database}` TO `{self.replicator.target_database}_old`',
-                    )
-                    self.replicator.clickhouse_api.execute_command(
-                        f'RENAME DATABASE `{self.replicator.target_database_tmp}` TO `{self.replicator.target_database}`',
-                    )
-                    self.replicator.clickhouse_api.drop_database(f'{self.replicator.target_database}_old')
-                else:
-                    self.replicator.clickhouse_api.execute_command(
-                        f'RENAME DATABASE `{self.replicator.target_database_tmp}` TO `{self.replicator.target_database}`',
-                    )
+                self.swap_initial_replication_database()
             self.replicator.clickhouse_api.database = self.replicator.target_database
             # Execute post-initial-replication commands
             self.execute_post_initial_replication_commands()
         logger.info(f'initial replication - done')
+
+    def swap_initial_replication_database(self):
+        logger.info(f'initial replication - swapping database')
+        target_database = self.replicator.target_database
+        target_database_tmp = self.replicator.target_database_tmp
+        target_database_old = f'{target_database}_old'
+        databases = self.replicator.clickhouse_api.get_databases()
+
+        if target_database_tmp not in databases:
+            if target_database in databases:
+                logger.info(
+                    f'temporary database {target_database_tmp} is missing; '
+                    f'{target_database} already exists, treating initial replication swap as complete'
+                )
+                return
+            raise Exception(f'temporary database {target_database_tmp} does not exist')
+
+        if target_database in databases:
+            backup_database = self.get_swap_backup_database(target_database, databases)
+            if backup_database != target_database_old:
+                logger.warning(
+                    f'backup database {target_database_old} already exists; '
+                    f'using {backup_database} for this initial replication swap'
+                )
+            self.replicator.clickhouse_api.execute_command(
+                f'RENAME DATABASE `{target_database}` TO `{backup_database}`',
+            )
+            self.replicator.clickhouse_api.execute_command(
+                f'RENAME DATABASE `{target_database_tmp}` TO `{target_database}`',
+            )
+            self.replicator.clickhouse_api.drop_database(backup_database)
+            return
+
+        self.replicator.clickhouse_api.execute_command(
+            f'RENAME DATABASE `{target_database_tmp}` TO `{target_database}`',
+        )
+
+    def get_swap_backup_database(self, target_database, databases):
+        backup_database = f'{target_database}_old'
+        if backup_database not in databases:
+            return backup_database
+
+        suffix = 1
+        while f'{backup_database}_{suffix}' in databases:
+            suffix += 1
+        return f'{backup_database}_{suffix}'
 
     def perform_initial_replication_table(self, table_name):
         logger.info(f'running initial replication for table {table_name}')

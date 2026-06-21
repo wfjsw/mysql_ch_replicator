@@ -112,14 +112,58 @@ class DbReplicatorRealtime:
         self.replicator.state.tables_last_record_version = self.replicator.clickhouse_api.tables_last_record_version
         self.replicator.state.save()
 
+    @staticmethod
+    def _strip_clickhouse_type_wrapper(field_type: str, wrapper: str) -> str | None:
+        prefix = f'{wrapper}('
+        stripped_type = field_type.strip()
+        if not stripped_type.lower().startswith(prefix.lower()) or not stripped_type.endswith(')'):
+            return None
+        return stripped_type[len(prefix):-1].strip()
+
+    @classmethod
+    def _unwrap_clickhouse_type(cls, field_type: str) -> str:
+        stripped_type = field_type.strip()
+        wrapped_type = cls._strip_clickhouse_type_wrapper(stripped_type, 'Nullable')
+        if wrapped_type is not None:
+            return cls._unwrap_clickhouse_type(wrapped_type)
+        wrapped_type = cls._strip_clickhouse_type_wrapper(stripped_type, 'LowCardinality')
+        if wrapped_type is not None:
+            return cls._unwrap_clickhouse_type(wrapped_type)
+        return stripped_type
+
+    @classmethod
+    def _is_clickhouse_enum_type(cls, field_type: str) -> bool:
+        lower_type = cls._unwrap_clickhouse_type(field_type).lower()
+        return lower_type.startswith('enum8(') or lower_type.startswith('enum16(')
+
+    @classmethod
+    def _is_clickhouse_string_literal_type(cls, field_type: str) -> bool:
+        lower_type = cls._unwrap_clickhouse_type(field_type).lower()
+        return (
+            lower_type == 'string' or
+            lower_type.startswith('fixedstring(') or
+            cls._is_clickhouse_enum_type(field_type)
+        )
+
+    @staticmethod
+    def _escape_clickhouse_string(value):
+        return str(value).replace('\\', '\\\\').replace("'", "\\'")
+
+    @classmethod
+    def _format_primary_key_value(cls, field_type: str, value):
+        if value is None:
+            return 'NULL'
+        if cls._is_clickhouse_enum_type(field_type) and not isinstance(value, str):
+            return value
+        if cls._is_clickhouse_string_literal_type(field_type):
+            return f"'{cls._escape_clickhouse_string(value)}'"
+        return value
+
     def _get_record_id(self, ch_table_structure, record: list):
         result = []
         for idx in ch_table_structure.primary_key_ids:
             field_type = ch_table_structure.fields[idx].field_type
-            if field_type == 'String':
-                result.append(f"'{record[idx]}'")
-            else:
-                result.append(record[idx])
+            result.append(self._format_primary_key_value(field_type, record[idx]))
         return ','.join(map(str, result))
 
     def handle_insert_event(self, event: LogEvent):

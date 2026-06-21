@@ -75,6 +75,42 @@ def _make_initial_replicator(threads, tmp_path):
     return DbReplicatorInitial(replicator), state, db_dir
 
 
+class _SwapClickHouseApi:
+    def __init__(self, databases):
+        self.databases = set(databases)
+        self.commands = []
+        self.dropped_databases = []
+
+    def get_databases(self):
+        return list(self.databases)
+
+    def drop_database(self, db_name):
+        self.dropped_databases.append(db_name)
+        self.databases.discard(db_name)
+
+    def execute_command(self, query):
+        self.commands.append(query)
+        if not query.startswith('RENAME DATABASE '):
+            raise AssertionError(f'unexpected query: {query}')
+        _, source, _, destination, _ = query.split('`')
+        if source not in self.databases:
+            raise AssertionError(f'source database does not exist: {source}')
+        if destination in self.databases:
+            raise AssertionError(f'destination database already exists: {destination}')
+        self.databases.remove(source)
+        self.databases.add(destination)
+
+
+def _make_swap_initial_replicator(databases):
+    clickhouse_api = _SwapClickHouseApi(databases)
+    replicator = SimpleNamespace(
+        target_database='target_db',
+        target_database_tmp='target_db_tmp',
+        clickhouse_api=clickhouse_api,
+    )
+    return DbReplicatorInitial(replicator), clickhouse_api
+
+
 def _capture_worker_commands(monkeypatch):
     commands = []
 
@@ -219,3 +255,42 @@ def test_table_worker_with_no_split_point_slice_returns_without_index_error(tmp_
 
     assert state.initial_replication_table is None
     assert state.initial_replication_completed_tables == []
+
+
+def test_initial_replication_swap_replaces_existing_database_and_removes_tmp():
+    initial, clickhouse_api = _make_swap_initial_replicator({
+        'target_db',
+        'target_db_tmp',
+        'target_db_old',
+    })
+
+    initial.swap_initial_replication_database()
+
+    assert clickhouse_api.databases == {'target_db', 'target_db_old'}
+    assert clickhouse_api.dropped_databases == ['target_db_old_1']
+    assert clickhouse_api.commands == [
+        'RENAME DATABASE `target_db` TO `target_db_old_1`',
+        'RENAME DATABASE `target_db_tmp` TO `target_db`',
+    ]
+
+
+def test_initial_replication_swap_renames_tmp_when_target_is_missing():
+    initial, clickhouse_api = _make_swap_initial_replicator({'target_db_tmp', 'target_db_old'})
+
+    initial.swap_initial_replication_database()
+
+    assert clickhouse_api.databases == {'target_db', 'target_db_old'}
+    assert clickhouse_api.dropped_databases == []
+    assert clickhouse_api.commands == [
+        'RENAME DATABASE `target_db_tmp` TO `target_db`',
+    ]
+
+
+def test_initial_replication_swap_is_idempotent_when_tmp_is_already_renamed():
+    initial, clickhouse_api = _make_swap_initial_replicator({'target_db'})
+
+    initial.swap_initial_replication_database()
+
+    assert clickhouse_api.databases == {'target_db'}
+    assert clickhouse_api.dropped_databases == []
+    assert clickhouse_api.commands == []
