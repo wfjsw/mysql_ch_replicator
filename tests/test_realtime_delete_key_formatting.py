@@ -1,3 +1,5 @@
+import datetime
+
 from mysql_ch_replicator.db_replicator_realtime import DbReplicatorRealtime
 from mysql_ch_replicator.table_structure import TableField, TableStructure
 
@@ -74,3 +76,38 @@ def test_record_id_escapes_clickhouse_string_primary_key_values():
     record_id = realtime._get_record_id(structure, [1, "role\\owner's"])
 
     assert record_id == "1,'role\\\\owner\\'s'"
+
+
+def test_record_id_quotes_clickhouse_datetime_primary_key_values():
+    realtime = DbReplicatorRealtime.__new__(DbReplicatorRealtime)
+    structure = _structure(
+        fields=[
+            TableField(name='id', field_type='UInt64'),
+            TableField(name='created_at', field_type='DateTime64(3)'),
+        ],
+        primary_keys=['id', 'created_at'],
+    )
+
+    record_id = realtime._get_record_id(
+        structure,
+        [1, datetime.datetime(2026, 5, 7, 0, 30, 2)],
+    )
+
+    assert record_id == "1,'2026-05-07 00:30:02'"
+
+
+def test_record_id_quotes_wrapped_clickhouse_date_primary_key_values():
+    realtime = DbReplicatorRealtime.__new__(DbReplicatorRealtime)
+    structure = _structure(
+        fields=[
+            TableField(name='effective_date', field_type='Nullable(Date32)'),
+        ],
+        primary_keys=['effective_date'],
+    )
+
+    record_id = realtime._get_record_id(
+        structure,
+        [datetime.date(2026, 5, 7)],
+    )
+
+    assert record_id == "'2026-05-07'"

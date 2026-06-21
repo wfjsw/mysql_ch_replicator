@@ -145,6 +145,15 @@ class DbReplicatorRealtime:
             cls._is_clickhouse_enum_type(field_type)
         )
 
+    @classmethod
+    def _is_clickhouse_temporal_literal_type(cls, field_type: str) -> bool:
+        lower_type = cls._unwrap_clickhouse_type(field_type).lower()
+        return (
+            lower_type == 'date' or
+            lower_type == 'date32' or
+            lower_type.startswith('datetime')
+        )
+
     @staticmethod
     def _escape_clickhouse_string(value):
         return str(value).replace('\\', '\\\\').replace("'", "\\'")
@@ -155,7 +164,10 @@ class DbReplicatorRealtime:
             return 'NULL'
         if cls._is_clickhouse_enum_type(field_type) and not isinstance(value, str):
             return value
-        if cls._is_clickhouse_string_literal_type(field_type):
+        if (
+            cls._is_clickhouse_string_literal_type(field_type) or
+            cls._is_clickhouse_temporal_literal_type(field_type)
+        ):
             return f"'{cls._escape_clickhouse_string(value)}'"
         return value
 
