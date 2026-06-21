@@ -245,9 +245,12 @@ class DbReplicatorRealtime:
         self.replicator.converter.convert_alter_query(query, db_name)
 
     def handle_create_table_query(self, query, db_name):
-        mysql_structure, ch_structure = self.replicator.converter.parse_create_table_query(query)
-        if not self.replicator.config.is_table_matches(mysql_structure.table_name):
+        _, table_name, matches_config = self.replicator.converter.get_create_table_db_and_table_name(query, db_name)
+        if not matches_config:
+            logger.info(f'CREATE TABLE: table {table_name} does not match config, skipping')
             return
+
+        mysql_structure, ch_structure = self.replicator.converter.parse_create_table_query(query)
         target_table_name = self.replicator.get_target_table_name(mysql_structure.table_name)
         ch_structure.table_name = target_table_name
         self.replicator.state.tables_structure[mysql_structure.table_name] = (mysql_structure, ch_structure)

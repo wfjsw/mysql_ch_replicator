@@ -708,6 +708,58 @@ class MysqlToClickhouseConverter:
 
         return db_name, table_name, matches_config
 
+    def get_create_table_db_and_table_name(self, mysql_query, db_name):
+        mysql_query = self.__basic_validate_query(mysql_query)
+        create_statement = self._strip_comments(mysql_query)
+
+        tokens = sqlparse.parse(create_statement.replace('\n', ' ').strip())[0].tokens
+        tokens = [t for t in tokens if not t.is_whitespace and not t.is_newline]
+
+        if (len(tokens) > 5 and
+                tokens[0].normalized.upper() == 'CREATE' and
+                tokens[1].normalized.upper() == 'TABLE' and
+                tokens[2].normalized.upper() == 'IF' and
+                tokens[3].normalized.upper() == 'NOT' and
+                tokens[4].normalized.upper() == 'EXISTS'):
+            del tokens[2:5]
+
+        if len(tokens) < 3:
+            raise Exception('wrong create statement', create_statement)
+        if tokens[0].ttype != sqlparse.tokens.DDL:
+            raise Exception('wrong create statement', create_statement)
+        if tokens[0].normalized.lower() != 'create':
+            raise Exception('wrong create statement', create_statement)
+        if tokens[1].ttype != sqlparse.tokens.Keyword:
+            raise Exception('wrong create statement', create_statement)
+        if tokens[1].normalized.lower() != 'table':
+            raise Exception('wrong create statement', create_statement)
+        if not isinstance(tokens[2], sqlparse.sql.Identifier):
+            raise Exception('wrong create statement', create_statement)
+
+        table_identifier = tokens[2]
+        table_name = strip_sql_name(table_identifier.get_real_name())
+        parent_db_name = table_identifier.get_parent_name()
+        has_parent_db_name = parent_db_name is not None
+        if parent_db_name:
+            db_name = strip_sql_name(parent_db_name)
+
+        if self.db_replicator:
+            if not has_parent_db_name and self.db_replicator.target_database == db_name:
+                matches_config = (
+                    self.db_replicator.config.is_database_matches(self.db_replicator.database)
+                    and self.db_replicator.config.is_table_matches(table_name))
+            else:
+                matches_config = (
+                    self.db_replicator.config.is_database_matches(db_name)
+                    and self.db_replicator.config.is_table_matches(table_name))
+
+            if db_name == self.db_replicator.database:
+                db_name = self.db_replicator.target_database
+        else:
+            matches_config = True
+
+        return db_name, table_name, matches_config
+
     def convert_alter_query(self, mysql_query, db_name):
         mysql_query = self.__basic_validate_query(mysql_query)
 

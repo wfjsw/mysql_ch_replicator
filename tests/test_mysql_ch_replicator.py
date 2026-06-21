@@ -15,6 +15,7 @@ from mysql_ch_replicator import mysql_api
 from mysql_ch_replicator import clickhouse_api
 from mysql_ch_replicator.binlog_replicator import State as BinlogState, FileReader, EventType, BinlogReplicator
 from mysql_ch_replicator.db_replicator import State as DbReplicatorState, DbReplicator, DbReplicatorInitial
+from mysql_ch_replicator.db_replicator_realtime import DbReplicatorRealtime
 from mysql_ch_replicator.converter import MysqlToClickhouseConverter
 
 from common import *
@@ -418,6 +419,67 @@ def test_parse_mysql_table_structure():
     structure = converter.parse_mysql_table_structure(query)
 
     assert structure.table_name == 'user_preferences_portal'
+
+
+def test_realtime_create_table_skips_excluded_table_before_structure_parse():
+    cfg = config.Settings()
+    cfg.databases = 'test_db'
+    cfg.tables = '*'
+    cfg.exclude_tables = ['certMasteries']
+
+    class FakeClickhouseApi:
+        def __init__(self):
+            self.created_tables = []
+
+        def create_table(self, ch_structure, additional_indexes=None, additional_partition_bys=None):
+            self.created_tables.append(ch_structure.table_name)
+
+    class FakeReplicator:
+        def __init__(self, cfg):
+            self.config = cfg
+            self.database = 'test_db'
+            self.target_database = 'test_db'
+            self.converter = MysqlToClickhouseConverter(self)
+            self.clickhouse_api = FakeClickhouseApi()
+            self.state = type('State', (), {'tables_structure': {}})()
+
+        def get_target_table_name(self, table_name):
+            return table_name
+
+    query = (
+        'create table `certMasteries` ('
+        '`typeID` int null, `masteryLevel` int null, `certID` int null'
+        ') default character set utf8mb4 collate utf8mb4_0900_ai_ci engine = InnoDB'
+    )
+    replicator = FakeReplicator(cfg)
+
+    DbReplicatorRealtime(replicator).handle_create_table_query(query, 'test_db')
+
+    assert replicator.clickhouse_api.created_tables == []
+    assert replicator.state.tables_structure == {}
+
+
+def test_create_table_name_extraction_respects_exclude_config():
+    cfg = config.Settings()
+    cfg.databases = 'test_db'
+    cfg.tables = '*'
+    cfg.exclude_tables = ['certMasteries']
+
+    class FakeReplicator:
+        config = cfg
+        database = 'test_db'
+        target_database = 'test_db'
+
+    converter = MysqlToClickhouseConverter(FakeReplicator())
+
+    db_name, table_name, matches_config = converter.get_create_table_db_and_table_name(
+        'CREATE TABLE IF NOT EXISTS `test_db`.`certMasteries` (`typeID` int null)',
+        'test_db',
+    )
+
+    assert db_name == 'test_db'
+    assert table_name == 'certMasteries'
+    assert matches_config is False
 
 
 def test_alter_tokens_split():
